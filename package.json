@@ -11,7 +11,8 @@
     "client-install": "cd client && npm install",
     "dev": "concurrently \"npm run watch\" \"npm run server\" \"npm run client\"",
     "build": "tsc && cd client && npm run build",
-    "watch": "tsc -w"
+    "watch": "tsc -w",
+    "build:full": "npm install && npm run client-install && npm run build"
   },
   "dependencies": {
     "express": "^4.18.2",
