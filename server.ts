@@ -110,6 +110,20 @@ function setupWebSockets(wss: WebSocketServer): void {
               },
             });
           }
+        } else if (data.type === "fireball") {
+          // Handle fireball
+          const player = players.get(ws);
+          if (player) {
+            // Broadcast fireball to all other clients
+            broadcastToOthers(wss, ws, {
+              type: "fireball",
+              data: {
+                playerId: player.id,
+                position: data.data.position,
+                direction: data.data.direction,
+              },
+            });
+          }
         }
       } catch (error) {
         console.error("Error processing message:", error);
