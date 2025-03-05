@@ -46,7 +46,7 @@ const Game: React.FC = () => {
     backward: false,
     left: false,
     right: false,
-    running: false,
+    running: true, // Start in running mode by default
     jumping: false,
     canJump: true,
     velocity: new THREE.Vector3(),
@@ -73,6 +73,16 @@ const Game: React.FC = () => {
   const playerIdRef = useRef<number | null>(null);
   const playersRef = useRef<Map<number, Player>>(new Map());
   const syncIntervalRef = useRef<number | null>(null);
+
+  // Add a reference for fireballs
+  const fireballsRef = useRef<THREE.Object3D[]>([]);
+  const fireballSpeedRef = useRef<number>(15); // Speed of fireballs
+  const lastFireballTimeRef = useRef<number>(0); // Time of last fireball
+  const fireballCooldownRef = useRef<number>(0.7); // Cooldown in seconds
+
+  // Define speed constants at the top of the component
+  const WALK_SPEED = 2;
+  const RUN_SPEED = 8; // Increased from 5 to 8 for faster running movement
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -163,6 +173,9 @@ const Game: React.FC = () => {
 
       // Animate coins
       animateCoins(delta);
+
+      // Update fireballs
+      updateFireballs(delta);
 
       // Update animation mixer
       if (mixerRef.current) {
@@ -256,6 +269,16 @@ const Game: React.FC = () => {
     // Initialize WebSocket connection
     connectToServer();
 
+    // Mouse click listener for fireballs
+    const handleMouseClick = (event: MouseEvent) => {
+      // Only fire on left click
+      if (event.button === 0) {
+        fireFireball();
+      }
+    };
+
+    window.addEventListener("click", handleMouseClick);
+
     // Cleanup
     return () => {
       // Remove event listeners
@@ -263,6 +286,7 @@ const Game: React.FC = () => {
       window.removeEventListener("keyup", handleKeyUp);
       window.removeEventListener("resize", handleResize);
       window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("click", handleMouseClick);
 
       // Dispose of Three.js resources
       if (rendererRef.current && containerRef.current) {
@@ -375,41 +399,27 @@ const Game: React.FC = () => {
       url: string,
       animName: string
     ): Promise<AnimationClip> => {
-      console.log(`Attempting to load animation: ${url}`);
-      try {
-        const gltf = await new Promise<any>((resolve, reject) => {
-          loader.load(
-            url,
-            (result) => {
-              console.log(`Successfully loaded ${url}`);
-              resolve(result);
-            },
-            (progress) =>
-              console.log(
-                `Loading ${url}: ${Math.round(
-                  (progress.loaded / progress.total) * 100
-                )}%`
-              ),
-            (error) => {
-              console.error(`Error loading ${url}:`, error);
-              reject(error);
-            }
-          );
-        });
-
-        // Get the first animation clip and rename it
-        const clip = gltf.animations[0];
-        if (!clip) {
-          console.error(`No animations found in ${url}`);
-          throw new Error(`No animations found in ${url}`);
-        }
-        clip.name = animName;
-
-        return { name: animName, clip };
-      } catch (error) {
-        console.error(`Error loading animation ${url}:`, error);
-        throw error;
-      }
+      return new Promise((resolve, reject) => {
+        loader.load(
+          url,
+          (result: any) => {
+            // Clip is in the animations array
+            const clip = result.animations[0];
+            resolve({ name: animName, clip });
+          },
+          (progress: any) => {
+            console.log(
+              `Loading ${animName}: ${Math.round(
+                (progress.loaded / progress.total) * 100
+              )}%`
+            );
+          },
+          (error: any) => {
+            console.error(`Error loading ${animName}:`, error);
+            reject(error);
+          }
+        );
+      });
     };
 
     try {
@@ -419,6 +429,10 @@ const Game: React.FC = () => {
         loadAnimation(`${window.location.origin}/model_walk.gltf`, "walk"),
         loadAnimation(`${window.location.origin}/model_run.gltf`, "run"),
         loadAnimation(`${window.location.origin}/model_jump.gltf`, "jump"),
+        loadAnimation(
+          `${window.location.origin}/model_punch_right.gltf`,
+          "punch"
+        ),
       ]);
 
       return animations;
@@ -435,15 +449,25 @@ const Game: React.FC = () => {
     const loader = new GLTFLoader();
 
     // Add debug logging
-    console.log(
-      "Available animations:",
-      animations.map((a) => a.name)
-    );
+    console.log("Loading character model...");
 
+    // Load the character model
     loader.load(
       "/model_idle.gltf",
-      (gltf) => {
+      (gltf: any) => {
         const model = gltf.scene;
+
+        // Log model hierarchy for debugging
+        console.log("Model loaded, hierarchy:");
+        model.traverse((node) => {
+          const isMesh = "isMesh" in node ? node.isMesh : false;
+          const isBone = "isBone" in node ? node.isBone : false;
+          console.log(
+            `- ${node.name} (${node.type}) ${isMesh ? "MESH" : ""} ${
+              isBone ? "BONE" : ""
+            }`
+          );
+        });
 
         // No material modifications - keep original textures and appearance
         model.traverse((node) => {
@@ -776,8 +800,15 @@ const Game: React.FC = () => {
 
   // Handle key down events
   const handleKeyDown = (event: KeyboardEvent) => {
-    if (event.repeat) return;
+    // Ignore if we're editing text input
+    if (
+      document.activeElement?.tagName === "INPUT" ||
+      document.activeElement?.tagName === "TEXTAREA"
+    ) {
+      return;
+    }
 
+    // Use code to handle key events (more reliable across keyboard layouts)
     switch (event.code) {
       case "KeyW":
         movementRef.current.forward = true;
@@ -791,24 +822,34 @@ const Game: React.FC = () => {
       case "KeyD":
         movementRef.current.right = true;
         break;
-      case "ShiftLeft":
-      case "ShiftRight":
-        // Reverse the running logic - now Shift makes you walk
-        movementRef.current.running = false;
-        break;
       case "Space":
+        // Only jump if we're on the ground
         if (movementRef.current.canJump) {
-          movementRef.current.velocity.y = 5;
+          console.log("Jump initiated");
+          movementRef.current.velocity.y = 7; // Jump velocity
           movementRef.current.jumping = true;
           movementRef.current.canJump = false;
+
+          // Schedule jump animation - it's one-time so we don't need to track it
           setAnimation("jump");
         }
+        break;
+      case "ShiftLeft":
+      case "ShiftRight":
+        // Hold Shift to walk instead of run
+        movementRef.current.running = false;
+        console.log("Walking mode activated");
+        break;
+      case "KeyF":
+        // Fire a projectile
+        fireFireball();
         break;
     }
   };
 
   // Handle key up events
   const handleKeyUp = (event: KeyboardEvent) => {
+    // Use code to handle key events (more reliable across keyboard layouts)
     switch (event.code) {
       case "KeyW":
         movementRef.current.forward = false;
@@ -822,30 +863,39 @@ const Game: React.FC = () => {
       case "KeyD":
         movementRef.current.right = false;
         break;
+      case "Space":
+        // Reset jumping state when space is released
+        movementRef.current.jumping = false;
+        break;
       case "ShiftLeft":
       case "ShiftRight":
-        // Return to running when Shift is released
+        // Default to running when Shift is released
         movementRef.current.running = true;
-        break;
-      case "Space":
-        movementRef.current.jumping = false;
+        console.log("Running mode activated");
         break;
     }
   };
 
-  // Update updateCharacterMovement function for cursor-based rotation and strafing
+  // Update character movement and animations
   const updateCharacterMovement = (delta: number) => {
-    if (!modelRef.current || !cameraRef.current) return;
+    if (!modelRef.current || !actionsRef.current || !mixerRef.current) return;
+
+    // Access references
+    const character = modelRef.current;
+    const mixer = mixerRef.current;
+
+    // Update animation mixer
+    mixer.update(delta);
 
     // Apply gravity
     movementRef.current.velocity.y -= 9.8 * delta;
 
     // Update character position based on velocity
-    modelRef.current.position.y += movementRef.current.velocity.y * delta;
+    character.position.y += movementRef.current.velocity.y * delta;
 
     // Floor collision
-    if (modelRef.current.position.y < groundOffsetRef.current) {
-      modelRef.current.position.y = groundOffsetRef.current;
+    if (character.position.y < groundOffsetRef.current) {
+      character.position.y = groundOffsetRef.current;
       movementRef.current.velocity.y = 0;
       movementRef.current.canJump = true;
     }
@@ -865,63 +915,79 @@ const Game: React.FC = () => {
     }
 
     // Apply camera rotation to direction
-    const cameraRotation = new THREE.Euler(0, cameraRef.current.rotation.y, 0);
-    movementRef.current.direction.applyEuler(cameraRotation);
+    if (cameraRef.current) {
+      const cameraRotation = new THREE.Euler(
+        0,
+        cameraRef.current.rotation.y,
+        0
+      );
+      movementRef.current.direction.applyEuler(cameraRotation);
+    }
 
-    // Animation state updates
-    const isMoving = movementRef.current.direction.length() >= 0.1;
-    const isRunning = movementRef.current.running && isMoving;
-    const isJumping = movementRef.current.jumping;
+    // Calculate if we're moving
+    const { direction, running, jumping } = movementRef.current;
+    const speed = direction.length();
+    const isMoving = speed > 0.1;
+    const isRunning = isMoving && running;
+    const isJumping = jumping;
 
-    // Only change animation if state changed
+    // Initialize previous state if not already done
+    if (!prevStateRef.current) {
+      prevStateRef.current = { isMoving, isRunning, isJumping };
+    }
+
+    // Determine which animation should be playing based on priority
+    let targetAnimation = "idle"; // Default animation
+
+    if (isJumping) {
+      targetAnimation = "jump";
+    } else if (isMoving) {
+      targetAnimation = isRunning ? "run" : "walk";
+    }
+
+    // Only update animation if there is a state change or jump is triggered
+    // Jump has highest priority and should always interrupt other animations
+    const prev = prevStateRef.current;
     if (
-      prevStateRef.current.isMoving !== isMoving ||
-      prevStateRef.current.isRunning !== isRunning ||
-      prevStateRef.current.isJumping !== isJumping
+      targetAnimation === "jump" || // Jump always triggers immediately
+      prev.isMoving !== isMoving ||
+      (isMoving && prev.isRunning !== isRunning) || // Only check running state if we're moving
+      prev.isJumping !== isJumping
     ) {
-      if (isJumping) {
-        setAnimation("jump");
-      } else if (isRunning) {
-        setAnimation("run");
-      } else if (isMoving) {
-        setAnimation("walk");
-      } else {
-        setAnimation("idle");
-      }
+      // Update the animation
+      setAnimation(targetAnimation);
 
-      // Update previous state
-      prevStateRef.current.isMoving = isMoving;
-      prevStateRef.current.isRunning = isRunning;
-      prevStateRef.current.isJumping = isJumping;
+      // Update previous state right away to avoid animation flicker
+      prevStateRef.current = { isMoving, isRunning, isJumping };
     }
 
     // Get the cursor direction for character facing when stationary
-    const cursorDirection = new THREE.Vector3(0, 0, -1);
-    cursorDirection.applyQuaternion(cameraRef.current.quaternion);
-    cursorDirection.y = 0;
-    cursorDirection.normalize();
+    if (cameraRef.current) {
+      const cursorDirection = new THREE.Vector3(0, 0, -1);
+      cursorDirection.applyQuaternion(cameraRef.current.quaternion);
+      cursorDirection.y = 0;
+      cursorDirection.normalize();
 
-    // If moving, face the direction of movement. Otherwise, face the cursor
-    if (isMoving) {
-      const targetRotation = Math.atan2(
-        movementRef.current.direction.x,
-        movementRef.current.direction.z
-      );
-      modelRef.current.rotation.y = targetRotation;
-    } else {
-      const cursorRotation = Math.atan2(cursorDirection.x, cursorDirection.z);
-      modelRef.current.rotation.y = cursorRotation;
+      // If moving, face the direction of movement. Otherwise, face the cursor
+      if (isMoving) {
+        const targetRotation = Math.atan2(
+          movementRef.current.direction.x,
+          movementRef.current.direction.z
+        );
+        character.rotation.y = targetRotation;
+      } else {
+        const cursorRotation = Math.atan2(cursorDirection.x, cursorDirection.z);
+        character.rotation.y = cursorRotation;
+      }
     }
 
     // Move character based on direction
-    const speed = movementRef.current.running ? 5 : 2;
-    modelRef.current.position.x +=
-      movementRef.current.direction.x * speed * delta;
-    modelRef.current.position.z +=
-      movementRef.current.direction.z * speed * delta;
+    const moveSpeed = running ? RUN_SPEED : WALK_SPEED;
+    character.position.x += direction.x * moveSpeed * delta;
+    character.position.z += direction.z * moveSpeed * delta;
 
     // Check for platform collisions
-    checkPlatformCollisions(modelRef.current.position);
+    checkPlatformCollisions(character.position);
 
     // Check for all other collisions and resolve them
     resolveCollisions();
@@ -975,61 +1041,84 @@ const Game: React.FC = () => {
       return;
     }
 
-    // Find the actively playing animation
-    let currentAction = null;
+    // Get the requested action
+    const nextAction = actions[name];
 
-    // Simple approach: manually check all animations
+    // Find the currently active animation
+    let currentAction = null;
+    let currentAnimName = null;
+
     for (const [animName, action] of Object.entries(actions)) {
+      // Check if animation is actively playing
       if (
         action.isRunning() &&
         !action.paused &&
         action.getEffectiveWeight() > 0.1
       ) {
         currentAction = action;
-        console.log(`Found current animation: ${animName}`);
+        currentAnimName = animName;
         break;
       }
     }
 
-    // Get the requested action
-    const nextAction = actions[name];
-
-    // If same animation, don't interrupt unless it's jump
-    if (currentAction === nextAction && name !== "jump") {
+    // If already playing the requested animation, don't interrupt
+    // (except for jump which should always play)
+    if (currentAction === nextAction && name !== "jump" && name !== "punch") {
       return;
     }
 
-    console.log(`Switching animation to: ${name}`);
+    console.log(
+      `Switching animation from ${currentAnimName || "none"} to ${name}`
+    );
 
-    // Force strong animation state
+    // Set up the next animation
     nextAction.reset();
     nextAction.enabled = true;
-    nextAction.setEffectiveTimeScale(1);
+    nextAction.setEffectiveTimeScale(1); // Set all animations to default speed
     nextAction.setEffectiveWeight(1);
 
-    // If there's a current animation, fade from it
+    // Handle transition from current animation if it exists
     if (currentAction) {
-      const duration = name === "jump" ? 0.1 : 0.3;
-      nextAction.crossFadeFrom(currentAction, duration, true);
+      // Quick transitions for jump and punch
+      const duration = name === "jump" || name === "punch" ? 0.1 : 0.3;
+
+      // Smoother transitions between walk and run
+      const smoothTransition =
+        (currentAnimName === "walk" && name === "run") ||
+        (currentAnimName === "run" && name === "walk");
+
+      nextAction.crossFadeFrom(
+        currentAction,
+        smoothTransition ? 0.5 : duration,
+        true
+      );
     }
 
     nextAction.play();
 
-    // Special handling for jump
-    if (name === "jump") {
-      // Create a one-time event listener to detect when the jump finishes
+    // Special handling for one-time animations
+    if (name === "jump" || name === "punch") {
+      // Configure as non-looping animation
+      nextAction.setLoop(THREE.LoopOnce, 1);
+      nextAction.clampWhenFinished = true;
+
+      // Create a one-time event listener for completion
       const onFinished = (e: THREE.Event) => {
         // Clean up the event listener
         mixer.removeEventListener("finished", onFinished);
 
-        // Go back to idle animation
-        console.log("Jump finished, returning to idle");
-        if (actions["idle"]) {
+        // Return to appropriate animation based on movement state
+        if (movementRef.current.direction.length() >= 0.1) {
+          const nextAnim = movementRef.current.running ? "run" : "walk";
+          console.log(`${name} finished, transitioning to ${nextAnim}`);
+          setAnimation(nextAnim);
+        } else {
+          console.log(`${name} finished, returning to idle`);
           setAnimation("idle");
         }
       };
 
-      // Use the mixer's event system instead of the action
+      // Use the mixer's event system
       mixer.addEventListener("finished", onFinished);
     }
   };
@@ -1230,24 +1319,76 @@ const Game: React.FC = () => {
         playerIdRef.current = data.id;
         console.log(`Initialized as player ${data.id}`);
 
-        // Add other existing players
+        // Add other existing players (filtering out our own ID for safety)
         data.players.forEach((player: Player) => {
-          createOtherPlayer(player);
+          if (player.id !== playerIdRef.current) {
+            createOtherPlayer(player);
+          }
         });
         break;
 
       case "playerJoined":
         console.log(`Player ${data.id} joined the game`);
-        createOtherPlayer(data);
+        // Don't create a model for the current player
+        if (data.id !== playerIdRef.current) {
+          createOtherPlayer(data);
+        }
         break;
 
       case "playerUpdate":
-        updateOtherPlayer(data);
+        // Ignore updates for the current player
+        if (data.id !== playerIdRef.current) {
+          updateOtherPlayer(data);
+        }
         break;
 
       case "playerLeft":
         console.log(`Player ${data.id} left the game`);
         removeOtherPlayer(data.id);
+        break;
+
+      case "fireball":
+        // Create a fireball from another player
+        if (!sceneRef.current) return;
+
+        console.log(`Received fireball from player ${data.playerId}`);
+
+        // Create fireball mesh
+        const geometry = new THREE.SphereGeometry(0.2, 16, 16);
+        const material = new THREE.MeshStandardMaterial({
+          color: 0xff4500,
+          emissive: 0xff7700,
+          emissiveIntensity: 2,
+        });
+
+        const fireball = new THREE.Mesh(geometry, material);
+
+        // Set position from data
+        fireball.position.set(
+          data.position.x,
+          data.position.y,
+          data.position.z
+        );
+
+        // Convert direction from data
+        const direction = new THREE.Vector3(
+          data.direction.x,
+          data.direction.y,
+          data.direction.z
+        );
+
+        // Store in userData
+        fireball.userData.direction = direction;
+        fireball.userData.createdTime = performance.now() / 1000;
+        fireball.userData.ownerId = data.playerId;
+
+        // Add to scene and tracking array
+        sceneRef.current.add(fireball);
+        fireballsRef.current.push(fireball);
+
+        // Add point light for glow effect
+        const light = new THREE.PointLight(0xff5500, 1, 2);
+        fireball.add(light);
         break;
 
       default:
@@ -1270,10 +1411,28 @@ const Game: React.FC = () => {
 
     // Determine current animation
     let animation = "idle";
-    if (movementRef.current.jumping) {
-      animation = "jump";
-    } else if (movementRef.current.direction.length() >= 0.1) {
-      animation = movementRef.current.running ? "run" : "walk";
+
+    // Check for active animations
+    const actions = actionsRef.current;
+    for (const [name, action] of Object.entries(actions)) {
+      if (
+        action.isRunning() &&
+        !action.paused &&
+        action.getEffectiveWeight() > 0.1
+      ) {
+        // Found active animation
+        animation = name;
+        break;
+      }
+    }
+
+    // Fallback to movement-based animation determination if no active animation found
+    if (animation === "idle") {
+      if (movementRef.current.jumping) {
+        animation = "jump";
+      } else if (movementRef.current.direction.length() >= 0.1) {
+        animation = movementRef.current.running ? "run" : "walk";
+      }
     }
 
     socketRef.current.send(
@@ -1292,6 +1451,20 @@ const Game: React.FC = () => {
   const createOtherPlayer = (player: Player) => {
     if (!sceneRef.current) return;
 
+    // Skip if this is the current player
+    if (player.id === playerIdRef.current) {
+      console.log(`Skipping model creation for self (player ${player.id})`);
+      return;
+    }
+
+    // Skip if player model already exists
+    if (playersRef.current.has(player.id)) {
+      console.log(
+        `Player ${player.id} model already exists, skipping creation`
+      );
+      return;
+    }
+
     console.log(`Creating model for player ${player.id}`);
 
     // Load the character model
@@ -1299,14 +1472,8 @@ const Game: React.FC = () => {
     loader.load("/model_idle.gltf", (gltf) => {
       const model = gltf.scene;
 
-      // No material modifications - keep original textures and appearance
-      model.traverse((node) => {
-        if ((node as THREE.Mesh).isMesh) {
-          const mesh = node as THREE.Mesh;
-          mesh.castShadow = true;
-          mesh.receiveShadow = true;
-        }
-      });
+      // Use the model exactly as loaded - no modifications at all
+      // No traversal, no shadow settings, no material changes
 
       // Set position and scale
       model.scale.set(0.02, 0.02, 0.02);
@@ -1353,6 +1520,7 @@ const Game: React.FC = () => {
       { url: "/model_walk.gltf", name: "walk" },
       { url: "/model_run.gltf", name: "run" },
       { url: "/model_jump.gltf", name: "jump" },
+      { url: "/model_punch_right.gltf", name: "punch" },
     ];
 
     const loader = new GLTFLoader();
@@ -1439,6 +1607,137 @@ const Game: React.FC = () => {
     }
   };
 
+  // Function to create and shoot a fireball
+  const fireFireball = () => {
+    if (!modelRef.current || !sceneRef.current || !cameraRef.current) return;
+
+    // Check cooldown
+    const now = performance.now() / 1000; // Convert to seconds
+    if (now - lastFireballTimeRef.current < fireballCooldownRef.current) {
+      return; // Still on cooldown
+    }
+    lastFireballTimeRef.current = now;
+
+    // Play punch animation
+    setAnimation("punch");
+
+    // Get direction directly from camera through cursor
+    const direction = getCursorDirection();
+
+    // Calculate fireball starting position (at the character's position)
+    const startPosition = modelRef.current.position.clone();
+    startPosition.y += 1.0; // Adjust height to come from hands
+
+    // Create fireball mesh
+    const geometry = new THREE.SphereGeometry(0.2, 16, 16);
+    const material = new THREE.MeshStandardMaterial({
+      color: 0xff4500, // Orange/red color
+      emissive: 0xff7700,
+      emissiveIntensity: 2,
+    });
+
+    const fireball = new THREE.Mesh(geometry, material);
+    fireball.position.copy(startPosition);
+
+    // Store direction vector for movement
+    fireball.userData.direction = direction;
+    fireball.userData.createdTime = now;
+    fireball.userData.ownerId = playerIdRef.current;
+
+    // Add to scene and tracking array
+    sceneRef.current.add(fireball);
+    fireballsRef.current.push(fireball);
+
+    // Add point light to fireball for glow effect
+    const light = new THREE.PointLight(0xff5500, 1, 2);
+    fireball.add(light);
+
+    // Broadcast fireball to other players
+    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+      socketRef.current.send(
+        JSON.stringify({
+          type: "fireball",
+          data: {
+            position: {
+              x: startPosition.x,
+              y: startPosition.y,
+              z: startPosition.z,
+            },
+            direction: { x: direction.x, y: direction.y, z: direction.z },
+          },
+        })
+      );
+    }
+  };
+
+  // Function to update fireballs position and check collisions
+  const updateFireballs = (delta: number) => {
+    const speed = fireballSpeedRef.current;
+    const now = performance.now() / 1000;
+
+    // Update each fireball position
+    for (let i = fireballsRef.current.length - 1; i >= 0; i--) {
+      const fireball = fireballsRef.current[i];
+      const direction = fireball.userData.direction;
+
+      // Move fireball
+      fireball.position.add(direction.clone().multiplyScalar(speed * delta));
+
+      // Rotate the fireball for visual effect
+      fireball.rotation.x += 5 * delta;
+      fireball.rotation.z += 5 * delta;
+
+      // Check lifetime (remove after 3 seconds)
+      if (now - fireball.userData.createdTime > 3) {
+        sceneRef.current?.remove(fireball);
+        fireballsRef.current.splice(i, 1);
+        continue;
+      }
+
+      // Check collision with other players
+      playersRef.current.forEach((player, playerId) => {
+        if (player.model && playerId !== fireball.userData.ownerId) {
+          const distance = fireball.position.distanceTo(player.model.position);
+          if (distance < 0.5) {
+            // Hit radius
+            // Handle hit - remove fireball
+            sceneRef.current?.remove(fireball);
+            fireballsRef.current.splice(i, 1);
+
+            // Could add hit effect or scoring here
+            console.log(`Player ${playerId} hit by fireball!`);
+          }
+        }
+      });
+    }
+  };
+
+  // Function to get direction from character to cursor in 3D space
+  const getCursorDirection = (): THREE.Vector3 => {
+    if (!cameraRef.current || !modelRef.current) {
+      // Default forward direction if camera or model not available
+      return new THREE.Vector3(0, 0, 1);
+    }
+
+    // Create a raycaster from the camera through the cursor position
+    const raycaster = new THREE.Raycaster();
+
+    // Convert normalized coordinates to raycaster format (-1 to 1)
+    raycaster.setFromCamera(
+      new THREE.Vector2(mouseRef.current.x, mouseRef.current.y),
+      cameraRef.current
+    );
+
+    // Calculate the direction vector
+    const direction = raycaster.ray.direction.clone();
+
+    // Maintain the horizontal direction but reduce vertical component
+    direction.y *= 0.1; // Reduce vertical component to make shots more level
+    direction.normalize();
+
+    return direction;
+  };
+
   return (
     <div
       ref={containerRef}
@@ -1469,6 +1768,7 @@ const Game: React.FC = () => {
         <p style={{ margin: "5px 0" }}>Shift - Walk (Hold to walk slower)</p>
         <p style={{ margin: "5px 0" }}>Space - Jump</p>
         <p style={{ margin: "5px 0" }}>Mouse - Camera</p>
+        <p style={{ margin: "5px 0" }}>Left Click/F - Shoot Fireball</p>
       </div>
 
       {/* Add coin counter display */}
