@@ -158,12 +158,10 @@ function broadcastToAll(wss: WebSocketServer, message: any): void {
   });
 }
 
-// Generate a random color for players
+// Generate a fixed color for all players
 function getRandomColor() {
-  const colors = [
-    0xff0000, 0x00ff00, 0x0000ff, 0xffff00, 0xff00ff, 0x00ffff, 0xffa500,
-  ];
-  return colors[Math.floor(Math.random() * colors.length)];
+  // Return a fixed neutral color (light gray) instead of random colors
+  return 0xcccccc;
 }
 
 // Set up WebSocket handlers directly (remove the setupServer function)

@@ -445,29 +445,12 @@ const Game: React.FC = () => {
       (gltf) => {
         const model = gltf.scene;
 
-        // Apply shadows and simplify materials to prevent texture limit errors
+        // No material modifications - keep original textures and appearance
         model.traverse((node) => {
           if ((node as THREE.Mesh).isMesh) {
             const mesh = node as THREE.Mesh;
             mesh.castShadow = true;
             mesh.receiveShadow = true;
-
-            // Simplify complex materials to prevent exceeding texture limits
-            if (mesh.material) {
-              const originalMaterial =
-                mesh.material as THREE.MeshStandardMaterial;
-
-              // Create a simplified material
-              const simplifiedMaterial = new THREE.MeshStandardMaterial({
-                color: originalMaterial.color,
-                roughness: originalMaterial.roughness || 0.5,
-                metalness: originalMaterial.metalness || 0.5,
-                map: originalMaterial.map, // Keep only the base color map
-                // Omit other texture maps to reduce texture unit usage
-              });
-
-              mesh.material = simplifiedMaterial;
-            }
           }
         });
 
@@ -1316,15 +1299,12 @@ const Game: React.FC = () => {
     loader.load("/model_idle.gltf", (gltf) => {
       const model = gltf.scene;
 
-      // Set unique color for this player
+      // No material modifications - keep original textures and appearance
       model.traverse((node) => {
         if ((node as THREE.Mesh).isMesh) {
           const mesh = node as THREE.Mesh;
-          if (mesh.material) {
-            const material = mesh.material as THREE.MeshStandardMaterial;
-            // Set a unique color based on player ID
-            material.color.setHex(player.color);
-          }
+          mesh.castShadow = true;
+          mesh.receiveShadow = true;
         }
       });
 
