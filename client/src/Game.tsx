@@ -459,7 +459,7 @@ const Game: React.FC = () => {
 
         // Log model hierarchy for debugging
         console.log("Model loaded, hierarchy:");
-        model.traverse((node) => {
+        model.traverse((node: THREE.Object3D) => {
           const isMesh = "isMesh" in node ? node.isMesh : false;
           const isBone = "isBone" in node ? node.isBone : false;
           console.log(
@@ -470,7 +470,7 @@ const Game: React.FC = () => {
         });
 
         // No material modifications - keep original textures and appearance
-        model.traverse((node) => {
+        model.traverse((node: THREE.Object3D) => {
           if ((node as THREE.Mesh).isMesh) {
             const mesh = node as THREE.Mesh;
             mesh.castShadow = true;
