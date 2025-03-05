@@ -1035,7 +1035,7 @@ const Game: React.FC = () => {
     // Special handling for jump
     if (name === "jump") {
       // Create a one-time event listener to detect when the jump finishes
-      const onFinished = (e) => {
+      const onFinished = (e: THREE.Event) => {
         // Clean up the event listener
         mixer.removeEventListener("finished", onFinished);
 
