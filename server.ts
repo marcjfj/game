@@ -33,25 +33,7 @@ app.get("*", (req, res) => {
 const server = createServer(app);
 
 // Create a WebSocket server
-const wss = new WebSocketServer({
-  server,
-  clientTracking: true,
-  // Remove path restriction to handle connections at root
-  handleProtocols: (protocols: string[] | Set<string>) => {
-    if (Array.isArray(protocols) && protocols.length > 0) {
-      return protocols[0];
-    }
-    if (protocols instanceof Set && protocols.size > 0) {
-      return Array.from(protocols)[0];
-    }
-    return "";
-  },
-});
-
-// Add error handling for the WebSocket server
-wss.on("error", (error) => {
-  console.error("WebSocket Server Error:", error);
-});
+const wss = new WebSocketServer({ server });
 
 // Move setupWebSockets function to before createServer
 function setupWebSockets(wss: WebSocketServer): void {
@@ -62,14 +44,7 @@ function setupWebSockets(wss: WebSocketServer): void {
   let nextPlayerId = 1;
 
   // Handle WebSocket connections
-  wss.on("connection", (ws, req) => {
-    console.log("New WebSocket connection from:", req.socket.remoteAddress);
-
-    // Add error handling for individual connections
-    ws.on("error", (error) => {
-      console.error("WebSocket Client Error:", error);
-    });
-
+  wss.on("connection", (ws) => {
     // Assign a player ID
     const playerId = nextPlayerId++;
     const playerColor = getRandomColor();
@@ -83,6 +58,8 @@ function setupWebSockets(wss: WebSocketServer): void {
       position: { x: 0, y: 0, z: 0 },
       rotation: 0,
       animation: "idle",
+      health: 100,
+      maxHealth: 100,
     });
 
     // Send initial player ID to the client
@@ -108,6 +85,8 @@ function setupWebSockets(wss: WebSocketServer): void {
         position: { x: 0, y: 0, z: 0 },
         rotation: 0,
         animation: "idle",
+        health: 100,
+        maxHealth: 100,
       },
     });
 
@@ -132,13 +111,95 @@ function setupWebSockets(wss: WebSocketServer): void {
                 position: player.position,
                 rotation: player.rotation,
                 animation: player.animation,
+                health: player.health,
+                maxHealth: player.maxHealth,
               },
             });
+          }
+        } else if (data.type === "playerUpdate") {
+          // Handle player updates (including health changes)
+          const player = players.get(ws);
+          if (player) {
+            // Update player data
+            player.position = data.data.position;
+            player.rotation = data.data.rotation;
+            player.animation = data.data.animation;
+            player.health = data.data.health;
+
+            // Broadcast update to all other clients
+            broadcastToOthers(wss, ws, {
+              type: "playerUpdate",
+              data: {
+                id: player.id,
+                position: player.position,
+                rotation: player.rotation,
+                animation: player.animation,
+                health: player.health,
+                maxHealth: player.maxHealth,
+              },
+            });
+          }
+        } else if (
+          data.type === "damagePlayer" ||
+          data.type === "directDamage"
+        ) {
+          // Handle direct damage to a player
+          const sourcePlayer = players.get(ws);
+          if (!sourcePlayer) return;
+
+          const targetId = data.data.targetId;
+          const damage = data.data.damage;
+          const newHealth = data.data.newHealth || data.data.health;
+
+          console.log(
+            `[DAMAGE] Player ${sourcePlayer.id} damaged player ${targetId} for ${damage} damage. New health: ${newHealth}`
+          );
+
+          // Find the target player
+          let targetPlayer = null;
+          let targetWs = null;
+
+          // Find the WebSocket connection for the target player
+          for (const [playerWs, playerData] of players.entries()) {
+            if (playerData.id === targetId) {
+              targetPlayer = playerData;
+              targetWs = playerWs;
+              break;
+            }
+          }
+
+          if (targetPlayer && targetWs) {
+            // Update the target player's health
+            targetPlayer.health = newHealth;
+
+            console.log(
+              `[HEALTH] Updated player ${targetPlayer.id} health to ${targetPlayer.health}`
+            );
+
+            // Broadcast the health update to all clients
+            broadcastToAll(wss, {
+              type: "playerUpdate",
+              data: {
+                id: targetPlayer.id,
+                position: targetPlayer.position,
+                rotation: targetPlayer.rotation,
+                animation: targetPlayer.animation,
+                health: targetPlayer.health,
+                maxHealth: targetPlayer.maxHealth,
+              },
+            });
+          } else {
+            console.log(`[ERROR] Target player ${targetId} not found!`);
           }
         } else if (data.type === "fireball") {
           // Handle fireball
           const player = players.get(ws);
           if (player) {
+            console.log(`Player ${player.id} fired a fireball:`, {
+              position: data.data.position,
+              direction: data.data.direction,
+            });
+
             // Broadcast fireball to all other clients
             broadcastToOthers(wss, ws, {
               type: "fireball",

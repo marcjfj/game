@@ -6,11 +6,12 @@
   "main": "dist/server.js",
   "scripts": {
     "start": "node dist/server.js",
-    "server": "NODE_ENV=development node --watch dist/server.js",
+    "server": "nodemon --watch 'src/**/*' -e ts,json --exec 'npm run build-server && node dist/server.js'",
     "client": "cd client && npm run dev",
     "client-install": "cd client && npm install",
-    "dev": "concurrently \"npm run watch\" \"npm run server\" \"npm run client\"",
+    "dev": "concurrently \"npm run server\" \"npm run client\"",
     "build": "tsc && cd client && npm run build",
+    "build-server": "tsc",
     "watch": "tsc -w",
     "build:full": "npm install && npm run client-install && npm run build"
   },

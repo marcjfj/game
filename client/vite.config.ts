@@ -7,14 +7,23 @@ export default defineConfig({
   server: {
     host: "0.0.0.0",
     cors: true,
+    hmr: {
+      overlay: true,
+      protocol: "ws",
+      host: "localhost",
+      port: 24678,
+    },
+    watch: {
+      usePolling: true,
+      interval: 1000,
+    },
     proxy: {
       "/api": {
         target: "http://localhost:3000",
         changeOrigin: true,
       },
-      // Proxy all WebSocket connections
       "/": {
-        target: "ws://localhost:3000",
+        target: "http://localhost:3000",
         ws: true,
         changeOrigin: true,
       },
