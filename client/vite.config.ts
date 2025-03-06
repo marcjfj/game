@@ -6,14 +6,16 @@ export default defineConfig({
   plugins: [react()],
   server: {
     host: "0.0.0.0",
-    hmr: {
-      clientPort: 443,
-      host: "localhost",
-    },
     cors: true,
     proxy: {
       "/api": {
         target: "http://localhost:3000",
+        changeOrigin: true,
+      },
+      // Proxy all WebSocket connections
+      "/": {
+        target: "ws://localhost:3000",
+        ws: true,
         changeOrigin: true,
       },
     },

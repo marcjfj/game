@@ -33,7 +33,25 @@ app.get("*", (req, res) => {
 const server = createServer(app);
 
 // Create a WebSocket server
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({
+  server,
+  clientTracking: true,
+  // Remove path restriction to handle connections at root
+  handleProtocols: (protocols: string[] | Set<string>) => {
+    if (Array.isArray(protocols) && protocols.length > 0) {
+      return protocols[0];
+    }
+    if (protocols instanceof Set && protocols.size > 0) {
+      return Array.from(protocols)[0];
+    }
+    return "";
+  },
+});
+
+// Add error handling for the WebSocket server
+wss.on("error", (error) => {
+  console.error("WebSocket Server Error:", error);
+});
 
 // Move setupWebSockets function to before createServer
 function setupWebSockets(wss: WebSocketServer): void {
@@ -44,7 +62,14 @@ function setupWebSockets(wss: WebSocketServer): void {
   let nextPlayerId = 1;
 
   // Handle WebSocket connections
-  wss.on("connection", (ws) => {
+  wss.on("connection", (ws, req) => {
+    console.log("New WebSocket connection from:", req.socket.remoteAddress);
+
+    // Add error handling for individual connections
+    ws.on("error", (error) => {
+      console.error("WebSocket Client Error:", error);
+    });
+
     // Assign a player ID
     const playerId = nextPlayerId++;
     const playerColor = getRandomColor();
