@@ -20,6 +20,8 @@ const DEFAULT_CONFIG = {
     distance: 5,
     height: 2,
     smoothing: 0.1,
+    gamepadShoulderOffset: 0.3,
+    gamepadCharacterOffset: 1.2,
   },
   animation: {
     transitionSpeed: 0.2,
@@ -118,6 +120,34 @@ export function initControlPanel() {
     max: 0.5,
     step: 0.01,
   });
+
+  // Add gamepad-specific camera settings
+  const gamepadCameraFolder = cameraFolder.addFolder({
+    title: "Gamepad Camera Settings",
+    expanded: false, // Collapsed by default
+  });
+
+  gamepadCameraFolder.addBinding(
+    currentConfig.camera,
+    "gamepadShoulderOffset",
+    {
+      label: "Shoulder Offset",
+      min: 0,
+      max: 1.0,
+      step: 0.05,
+    }
+  );
+
+  gamepadCameraFolder.addBinding(
+    currentConfig.camera,
+    "gamepadCharacterOffset",
+    {
+      label: "Character Height",
+      min: 0,
+      max: 2.0,
+      step: 0.1,
+    }
+  );
 
   // Animation controls
   const animationFolder = pane.addFolder({ title: "Animation" });

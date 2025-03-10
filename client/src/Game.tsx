@@ -6,11 +6,15 @@ import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { initControlPanel, getConfig } from "./ControlPanel";
+import { EXRLoader } from "three/examples/jsm/loaders/EXRLoader.js";
 
 // Constants for player health
 const MAX_PLAYER_HEALTH = 100;
 const HEALTH_BAR_WIDTH = 100; // Width in pixels
 const HEALTH_BAR_HEIGHT = 10; // Height in pixels
+
+// Debug settings
+const GAMEPAD_DEBUG_MODE = false; // Set to true to enable gamepad debugging
 
 // Function to update the local player's HUD health bar
 const updateLocalPlayerHealthBar = (health: number) => {
@@ -37,7 +41,6 @@ interface AnimationClip {
 
 interface Player {
   id: number;
-  color: number;
   position: THREE.Vector3;
   rotation: number;
   animation: string;
@@ -52,7 +55,7 @@ interface Player {
   jumpStartTime?: number;
   kills: number;
   deaths: number;
-  name: string; // Add name property
+  name: string;
 }
 
 console.log("Loading models from", window.location.origin);
@@ -109,7 +112,6 @@ const Game: React.FC = () => {
   const collidableObjectsRef = useRef<THREE.Object3D[]>([]);
   const coinsRef = useRef<THREE.Object3D[]>([]);
   const coinCountRef = useRef<number>(0);
-  const playerColorRef = useRef<THREE.Color>(new THREE.Color(0x0000ff));
 
   // Character movement state
   const movementRef = useRef({
@@ -125,10 +127,19 @@ const Game: React.FC = () => {
     jumpStartTime: 0,
   });
 
+  // Gamepad support
+  const gamepadRef = useRef<Gamepad | null>(null);
+  const gamepadConnectedRef = useRef<boolean>(false);
+  const gamepadSensitivityRef = useRef<number>(0.15); // Adjust sensitivity as needed
+  const gamepadDeadzoneRef = useRef<number>(0.1); // Deadzone for analog sticks
+  const gamepadLastFireballTimeRef = useRef<number>(0);
+  const gamepadFireRateRef = useRef<number>(500); // In milliseconds, adjust as needed
+
   // Add this new useEffect to handle the DOM-based crosshair
   useEffect(() => {
     // Create a crosshair element that we'll control directly
     const crosshair = document.createElement("div");
+    crosshair.setAttribute("data-crosshair", "true"); // Add data attribute for easy selection
     crosshair.style.cssText = `
       position: fixed;
       width: 20px;
@@ -172,6 +183,12 @@ const Game: React.FC = () => {
     // Set initial position to center of screen
     crosshair.style.left = `${window.innerWidth / 2}px`;
     crosshair.style.top = `${window.innerHeight / 2}px`;
+
+    // Initialize mouseRef with these coordinates
+    mouseRef.current.pixelX = window.innerWidth / 2;
+    mouseRef.current.pixelY = window.innerHeight / 2;
+    mouseRef.current.x = 0; // Centered in normalized coordinates
+    mouseRef.current.y = 0;
 
     // Function to update crosshair position
     const updateCrosshairPosition = (e: MouseEvent) => {
@@ -445,14 +462,39 @@ const Game: React.FC = () => {
 
     // Process all scene objects recursively
     sceneRef.current.traverse((object) => {
-      // Replace all materials EXCEPT for the character model
+      // Replace all materials EXCEPT for player models and floor
       if ((object as THREE.Mesh).isMesh) {
         const mesh = object as THREE.Mesh;
 
-        // Skip character model - preserve its textures
+        // Skip local player model - preserve its textures
         if (isDescendantOf(object, modelRef.current!)) {
-          console.log("Preserving character model material");
-          return; // Don't modify character model materials
+          console.log("Preserving local player model material");
+          return; // Don't modify local player model materials
+        }
+
+        // Also skip other player models - preserve their textures too
+        let isPlayerModel = false;
+        playersRef.current.forEach((player) => {
+          if (player.model && isDescendantOf(object, player.model)) {
+            isPlayerModel = true;
+          }
+        });
+
+        if (isPlayerModel) {
+          console.log("Preserving other player model material");
+          return; // Don't modify other player model materials
+        }
+
+        // Preserve floor texture
+        if (mesh.userData && (mesh.userData.isFloor || mesh.userData.ground)) {
+          console.log("Preserving floor texture");
+          return; // Don't modify floor materials
+        }
+
+        // Preserve platform textures
+        if (mesh.userData && mesh.userData.isPlatform) {
+          console.log("Preserving platform texture");
+          return; // Don't modify platform materials
         }
 
         // For all other objects, use simple materials
@@ -486,7 +528,282 @@ const Game: React.FC = () => {
 
   // Create all environment objects
   const createEnvironment = (scene: THREE.Scene) => {
-    console.log("Creating simplified environment...");
+    console.log("Creating environment with textured floor...");
+
+    // Check if there's already a ground plane and remove it
+    const existingGround = scene.children.find(
+      (child) => child instanceof THREE.Mesh && child.userData.ground === true
+    );
+
+    if (existingGround) {
+      console.log("Removing existing ground plane...");
+      scene.remove(existingGround);
+    }
+
+    // Load the dirt floor textures first
+    console.log("Loading floor textures...");
+    const textureLoader = new THREE.TextureLoader();
+    const normalLoader = new EXRLoader();
+    const roughnessLoader = new EXRLoader();
+
+    // Load plaster textures for platforms
+    console.log("Loading plaster textures for platforms...");
+    const plasterDiffuseMap = textureLoader.load(
+      "/texture/painted_plaster_wall_diff_4k.jpg",
+      (texture) => {
+        console.log("Plaster diffuse map loaded successfully");
+        // Ensure texture is configured properly
+        texture.colorSpace = THREE.SRGBColorSpace;
+        texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+        texture.repeat.set(2, 2);
+      },
+      undefined,
+      (error) => console.error("Error loading plaster diffuse map:", error)
+    );
+
+    const plasterDisplacementMap = textureLoader.load(
+      "/texture/painted_plaster_wall_disp_4k.png",
+      (texture) => {
+        console.log("Plaster displacement map loaded successfully");
+        texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+        texture.repeat.set(2, 2);
+      },
+      undefined,
+      (error) => console.error("Error loading plaster displacement map:", error)
+    );
+
+    // Load diffuse and displacement immediately
+    console.log("Loading diffuse and displacement maps...");
+    const diffuseMap = textureLoader.load(
+      "/texture/dirt_floor_diff_4k.jpg",
+      (texture) => {
+        console.log("Diffuse map loaded successfully");
+        // Ensure texture is configured properly
+        texture.colorSpace = THREE.SRGBColorSpace;
+        texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+        texture.repeat.set(10, 10);
+      },
+      undefined,
+      (error) => console.error("Error loading diffuse map:", error)
+    );
+    const displacementMap = textureLoader.load(
+      "/texture/dirt_floor_disp_4k.png",
+      (texture) => {
+        console.log("Displacement map loaded successfully");
+        texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+        texture.repeat.set(10, 10);
+      },
+      undefined,
+      (error) => console.error("Error loading displacement map:", error)
+    );
+
+    // Create a basic fallback floor now that we have the textures
+    const createBasicFloor = () => {
+      console.log("Creating basic fallback floor...");
+      const floorSize = 100;
+      const floorGeometry = new THREE.PlaneGeometry(floorSize, floorSize);
+
+      // Try to use the diffuse texture right away if available
+      const floorMaterial = new THREE.MeshStandardMaterial({
+        color: 0x8b7355, // Dirt brown color
+        side: THREE.DoubleSide,
+        roughness: 1.0,
+        map: diffuseMap, // Apply the diffuse map immediately
+      });
+
+      if (floorMaterial.map) {
+        console.log("Applied diffuse map to basic floor");
+        floorMaterial.map.colorSpace = THREE.SRGBColorSpace;
+      }
+
+      const floor = new THREE.Mesh(floorGeometry, floorMaterial);
+      floor.rotation.x = -Math.PI / 2;
+      floor.position.y = 0;
+      floor.receiveShadow = true;
+      floor.userData.collidable = true;
+      floor.userData.isFloor = true;
+      floor.userData.ground = true;
+
+      collidableObjectsRef.current.push(floor);
+      scene.add(floor);
+      return floor;
+    };
+
+    // Create a basic floor immediately, replace it when textures load
+    const basicFloor = createBasicFloor();
+
+    // Using Promise to handle async loading of EXR textures
+    console.log("Loading normal and roughness maps...");
+    Promise.all([
+      new Promise<THREE.DataTexture | THREE.Texture>((resolve, reject) => {
+        // Try loading EXR first
+        normalLoader.load(
+          "/texture/dirt_floor_nor_gl_4k.exr",
+          (texture: THREE.DataTexture) => {
+            console.log("Normal map loaded successfully from EXR");
+            resolve(texture);
+          },
+          undefined,
+          (error: unknown) => {
+            console.warn(
+              "Error loading normal EXR map, trying fallback format:",
+              error
+            );
+            // Fallback to JPG/PNG if EXR fails
+            textureLoader.load(
+              "/texture/dirt_floor_nor_gl_4k.jpg",
+              (texture) => {
+                console.log("Normal map loaded from fallback JPG");
+                resolve(texture);
+              },
+              undefined,
+              (fallbackError) => {
+                console.error("All normal map formats failed:", fallbackError);
+                // Create a default normal map as last resort
+                const defaultNormalMap = new THREE.Texture();
+                defaultNormalMap.colorSpace = THREE.SRGBColorSpace;
+                resolve(defaultNormalMap);
+              }
+            );
+          }
+        );
+      }),
+      new Promise<THREE.DataTexture | THREE.Texture>((resolve, reject) => {
+        roughnessLoader.load(
+          "/texture/dirt_floor_rough_4k.exr",
+          (texture: THREE.DataTexture) => {
+            console.log("Roughness map loaded successfully from EXR");
+            resolve(texture);
+          },
+          undefined,
+          (error: unknown) => {
+            console.warn(
+              "Error loading roughness EXR map, trying fallback format:",
+              error
+            );
+            // Fallback to JPG/PNG if EXR fails
+            textureLoader.load(
+              "/texture/dirt_floor_rough_4k.jpg",
+              (texture) => {
+                console.log("Roughness map loaded from fallback JPG");
+                resolve(texture);
+              },
+              undefined,
+              (fallbackError) => {
+                console.error(
+                  "All roughness map formats failed:",
+                  fallbackError
+                );
+                // Create a default roughness map as last resort
+                const defaultRoughnessMap = new THREE.Texture();
+                defaultRoughnessMap.colorSpace = THREE.SRGBColorSpace;
+                resolve(defaultRoughnessMap);
+              }
+            );
+          }
+        );
+      }),
+    ])
+      .then(([normalMap, roughnessMap]) => {
+        console.log("All textures loaded successfully, creating PBR floor...");
+        // Create the floor
+        const floorSize = 100;
+        const floorGeometry = new THREE.PlaneGeometry(
+          floorSize,
+          floorSize,
+          64,
+          64
+        );
+
+        // Create PBR material with all textures
+        const floorMaterial = new THREE.MeshStandardMaterial({
+          map: diffuseMap,
+          normalMap: normalMap,
+          roughnessMap: roughnessMap,
+          displacementMap: displacementMap,
+          displacementScale: 0.1, // Reduced scale to be less dramatic
+          roughness: 1.0,
+          metalness: 0.0,
+          side: THREE.DoubleSide,
+          color: 0x8b7355, // Add a base color in case textures fail
+        });
+
+        console.log("Floor material properties:", {
+          hasMap: !!floorMaterial.map,
+          hasNormalMap: !!floorMaterial.normalMap,
+          hasRoughnessMap: !!floorMaterial.roughnessMap,
+          hasDisplacementMap: !!floorMaterial.displacementMap,
+        });
+
+        // Ensure textures are properly configured
+        [diffuseMap, normalMap, roughnessMap, displacementMap].forEach(
+          (map, index) => {
+            if (!map) {
+              console.warn(`Texture at index ${index} is undefined`);
+              return;
+            }
+            console.log(`Texture ${index} properties:`, {
+              isTexture: map instanceof THREE.Texture,
+              image: !!map.image,
+              needsUpdate: map.needsUpdate,
+              wrapS: map.wrapS,
+              wrapT: map.wrapT,
+            });
+          }
+        );
+
+        // Force update of textures
+        floorMaterial.needsUpdate = true;
+
+        // Adjust texture properties for proper tiling
+        diffuseMap.wrapS = diffuseMap.wrapT = THREE.RepeatWrapping;
+        normalMap.wrapS = normalMap.wrapT = THREE.RepeatWrapping;
+        roughnessMap.wrapS = roughnessMap.wrapT = THREE.RepeatWrapping;
+        displacementMap.wrapS = displacementMap.wrapT = THREE.RepeatWrapping;
+
+        // Set encoding for the textures to ensure proper display
+        diffuseMap.colorSpace = THREE.SRGBColorSpace;
+
+        // Set repeat to tile the texture multiple times across the floor
+        const repeat = 10;
+        diffuseMap.repeat.set(repeat, repeat);
+        normalMap.repeat.set(repeat, repeat);
+        roughnessMap.repeat.set(repeat, repeat);
+        displacementMap.repeat.set(repeat, repeat);
+
+        // Create the floor mesh
+        const floor = new THREE.Mesh(floorGeometry, floorMaterial);
+        floor.rotation.x = -Math.PI / 2; // Rotate to be horizontal
+        floor.position.y = 0; // At ground level
+        floor.receiveShadow = true;
+
+        // Tag as collidable floor and ground
+        floor.userData.collidable = true;
+        floor.userData.isFloor = true;
+        floor.userData.ground = true; // Mark as ground for consistency
+
+        console.log("Floor mesh created with userData:", floor.userData);
+
+        // Remove the basic floor and add the textured one
+        console.log("Replacing basic floor with textured floor...");
+        scene.remove(basicFloor);
+        const basicFloorIndex =
+          collidableObjectsRef.current.indexOf(basicFloor);
+        if (basicFloorIndex !== -1) {
+          collidableObjectsRef.current.splice(basicFloorIndex, 1);
+        }
+
+        // Add to scene and collision objects
+        collidableObjectsRef.current.push(floor);
+        scene.add(floor);
+        console.log("Textured floor added to scene");
+      })
+      .catch((error) => {
+        console.error(
+          "Failed to load EXR textures, keeping basic floor:",
+          error
+        );
+      });
 
     // Create just a few simple platforms for jumping
     const platforms = [
@@ -498,57 +815,263 @@ const Game: React.FC = () => {
     // Basic material for all objects
     const basicMaterial = new THREE.MeshBasicMaterial({ color: 0x999999 });
 
+    // Create a textured material for platforms using plaster textures
+    const platformMaterial = new THREE.MeshStandardMaterial({
+      map: plasterDiffuseMap,
+      normalMap: plasterDisplacementMap, // Use displacement map as normal map instead
+      normalScale: new THREE.Vector2(0.1, 0.1), // Subtle normal mapping
+      roughness: 0.8,
+      metalness: 0.1,
+      side: THREE.DoubleSide,
+      color: 0xbbbbbb, // Light gray base color
+    });
+
+    // Configure texture settings for platforms
+    [plasterDiffuseMap, plasterDisplacementMap].forEach((texture) => {
+      if (texture) {
+        texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+        texture.repeat.set(2, 2); // Slightly larger repeat for better edge coverage
+        if (texture === plasterDiffuseMap) {
+          texture.colorSpace = THREE.SRGBColorSpace;
+        }
+      }
+    });
+
     // Create platforms
     platforms.forEach((platform) => {
+      // Create beveled box geometry for smoother edges
       const geometry = new THREE.BoxGeometry(
-        platform.size,
+        platform.size + 0.1, // Slightly larger base
         platform.y * 2,
-        platform.size
+        platform.size + 0.1,
+        1, // Reduced segments since we're not using displacement
+        1,
+        1
       );
-      const mesh = new THREE.Mesh(geometry, basicMaterial.clone());
+
+      // Add bevel modifier
+      const beveled = new THREE.BufferGeometry();
+      const positions = Array.from(geometry.attributes.position.array);
+      const normals = Array.from(geometry.attributes.normal.array);
+      const uvs = Array.from(geometry.attributes.uv.array);
+      const indices = geometry.index ? Array.from(geometry.index.array) : [];
+
+      // Create new arrays for the beveled geometry
+      const newPositions: number[] = [];
+      const newNormals: number[] = [];
+      const newUvs: number[] = [];
+
+      // Process each vertex
+      for (let i = 0; i < positions.length; i += 3) {
+        const x = positions[i];
+        const y = positions[i + 1];
+        const z = positions[i + 2];
+
+        // Get vertex normal
+        const nx = normals[i];
+        const ny = normals[i + 1];
+        const nz = normals[i + 2];
+
+        // Add original vertex slightly inset
+        const insetAmount = 0.02; // Bevel size
+        newPositions.push(
+          x - nx * insetAmount,
+          y - ny * insetAmount,
+          z - nz * insetAmount
+        );
+        newNormals.push(nx, ny, nz);
+        newUvs.push(uvs[(i / 3) * 2], uvs[(i / 3) * 2 + 1]);
+      }
+
+      // Set up the new geometry
+      beveled.setAttribute(
+        "position",
+        new THREE.Float32BufferAttribute(newPositions, 3)
+      );
+      beveled.setAttribute(
+        "normal",
+        new THREE.Float32BufferAttribute(newNormals, 3)
+      );
+      beveled.setAttribute("uv", new THREE.Float32BufferAttribute(newUvs, 2));
+      beveled.setIndex(indices);
+      beveled.computeVertexNormals();
+
+      // Create the mesh with beveled geometry
+      const mesh = new THREE.Mesh(beveled, platformMaterial.clone());
       mesh.position.set(platform.x, platform.y, platform.z);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
 
       // Tag as collidable and add to collision tracking
       mesh.userData.collidable = true;
-      mesh.userData.isPlatform = true; // Tag as platform for jumping
-      mesh.userData.top = platform.y * 2; // Store height for collision
+      mesh.userData.isPlatform = true;
+      mesh.userData.top = platform.y * 2;
       collidableObjectsRef.current.push(mesh);
 
       scene.add(mesh);
     });
 
     // Create a few simple decorative elements
-    // Tree-like shapes
+    // Palm trees using GLTF model
     for (let i = 0; i < 5; i++) {
-      const trunkGeo = new THREE.CylinderGeometry(0.2, 0.3, 2, 8);
-      const trunk = new THREE.Mesh(
-        trunkGeo,
-        new THREE.MeshBasicMaterial({ color: 0x8b4513 })
-      );
-
-      const topGeo = new THREE.ConeGeometry(1, 2, 8);
-      const top = new THREE.Mesh(
-        topGeo,
-        new THREE.MeshBasicMaterial({ color: 0x228b22 })
-      );
-      top.position.y = 2;
-
-      const tree = new THREE.Group();
-      tree.add(trunk);
-      tree.add(top);
-
       const angle = Math.random() * Math.PI * 2;
       const dist = 10 + Math.random() * 10;
-      tree.position.set(Math.cos(angle) * dist, 1, Math.sin(angle) * dist);
+      const posX = Math.cos(angle) * dist;
+      const posZ = Math.sin(angle) * dist;
 
-      // Add collision for tree trunk
-      const collisionRadius = 0.5; // Collision radius for trunk
-      trunk.userData.collidable = true;
-      trunk.userData.isObstacle = true;
-      trunk.userData.radius = collisionRadius;
-      collidableObjectsRef.current.push(trunk);
+      // Load palm tree GLTF model
+      const loader = new GLTFLoader();
+      loader.load(
+        "/models/trees/scene.gltf",
+        (gltf) => {
+          const model = gltf.scene;
 
-      scene.add(tree);
+          // Scale and position the model - palm trees are typically tall
+          model.scale.set(1.5, 1.5, 1.5); // Slightly smaller scale
+          model.position.set(posX, 0, posZ); // Initial position
+
+          // Rotate randomly for variety
+          model.rotation.y = Math.random() * Math.PI * 2;
+
+          // Find the lowest point of the model and position it on the ground
+          // We need to wait for the model to be fully loaded before calculating the bounding box
+          setTimeout(() => {
+            const boundingBox = new THREE.Box3().setFromObject(model);
+            const offset = -boundingBox.min.y;
+            model.position.y = offset;
+            console.log(`Palm tree positioned at offset: ${offset}`);
+          }, 100);
+
+          // Add to scene
+          scene.add(model);
+
+          // Find the trunk for collision
+          let trunkFound = false;
+          model.traverse((node) => {
+            if (
+              node.name &&
+              (node.name.includes("trunk") ||
+                node.name.includes("Trunk") ||
+                node.name.includes("Branches_trunk_Mat_0"))
+            ) {
+              // Add collision data to the trunk
+              node.userData.collidable = true;
+              node.userData.isObstacle = true;
+              node.userData.radius = 0.5; // Smaller collision radius for better gameplay
+              collidableObjectsRef.current.push(node);
+              trunkFound = true;
+            }
+          });
+
+          // If no specific trunk is found, add collision to the whole model
+          if (!trunkFound) {
+            // Add a simplified collision cylinder for the trunk
+            const collisionRadius = 0.5;
+            const collisionHeight = 4.0;
+            const collisionGeo = new THREE.CylinderGeometry(
+              collisionRadius,
+              collisionRadius,
+              collisionHeight,
+              8
+            );
+            const collisionMesh = new THREE.Mesh(
+              collisionGeo,
+              new THREE.MeshBasicMaterial({
+                color: 0xff0000,
+                wireframe: true,
+                visible: false, // Hide the collision mesh
+              })
+            );
+
+            // Position the collision cylinder at the base of the tree
+            collisionMesh.position.copy(model.position);
+            collisionMesh.position.y = collisionHeight / 2; // Center vertically
+
+            // Add collision data
+            collisionMesh.userData.collidable = true;
+            collisionMesh.userData.isObstacle = true;
+            collisionMesh.userData.radius = collisionRadius;
+
+            // Add to scene and collision objects
+            model.add(collisionMesh);
+            collidableObjectsRef.current.push(collisionMesh);
+          }
+
+          // Apply texture limit fix to the tree model to improve performance
+          model.traverse((node) => {
+            if ((node as THREE.Mesh).isMesh) {
+              const mesh = node as THREE.Mesh;
+
+              // Keep the original material color
+              let color = 0x8b4513; // Default brown
+              try {
+                if (mesh.material && "color" in mesh.material) {
+                  color = (mesh.material as any).color.getHex();
+                }
+              } catch (e) {}
+
+              // Use MeshLambertMaterial for better performance while keeping some shading
+              if (
+                node.name.includes("trunk") ||
+                node.name.includes("Trunk") ||
+                node.name.includes("Branches")
+              ) {
+                mesh.material = new THREE.MeshLambertMaterial({
+                  color: 0x8b4513,
+                }); // Brown for trunk
+              } else if (
+                node.name.includes("leaves") ||
+                node.name.includes("Fronds")
+              ) {
+                mesh.material = new THREE.MeshLambertMaterial({
+                  color: 0x228b22,
+                  transparent: true,
+                  opacity: 0.95,
+                  side: THREE.DoubleSide, // Render both sides of leaf geometry
+                }); // Green for leaves
+              }
+            }
+          });
+        },
+        (xhr) => {
+          console.log(
+            `Palm tree model ${i + 1}: ${Math.round(
+              (xhr.loaded / xhr.total) * 100
+            )}% loaded`
+          );
+        },
+        (error) => {
+          console.error("Error loading palm tree model:", error);
+
+          // Fallback to simple tree if model fails to load
+          const trunkGeo = new THREE.CylinderGeometry(0.2, 0.3, 2, 8);
+          const trunk = new THREE.Mesh(
+            trunkGeo,
+            new THREE.MeshBasicMaterial({ color: 0x8b4513 })
+          );
+
+          const topGeo = new THREE.ConeGeometry(1, 2, 8);
+          const top = new THREE.Mesh(
+            topGeo,
+            new THREE.MeshBasicMaterial({ color: 0x228b22 })
+          );
+          top.position.y = 2;
+
+          const tree = new THREE.Group();
+          tree.add(trunk);
+          tree.add(top);
+          tree.position.set(posX, 1, posZ);
+
+          // Add collision for tree trunk
+          const collisionRadius = 0.5;
+          trunk.userData.collidable = true;
+          trunk.userData.isObstacle = true;
+          trunk.userData.radius = collisionRadius;
+          collidableObjectsRef.current.push(trunk);
+
+          scene.add(tree);
+        }
+      );
     }
 
     // Create coins
@@ -979,10 +1502,29 @@ const Game: React.FC = () => {
     // Set camera target to character position
     const targetPosition = modelRef.current.position.clone();
 
+    // For gamepad controls, we'll use an optimized third-person shooter camera setup
+    // This places the character lower in the view for better aiming
+    if (gamepadConnectedRef.current) {
+      // When using gamepad, modify the target position to look slightly above the player
+      // This creates an "over the shoulder" view common in third-person shooters
+      targetPosition.y += config.camera.gamepadCharacterOffset; // Use the configurable value
+    }
+
     // Calculate camera position based on character position and mouse
     const cameraDistance = config.camera.distance; // Distance from character
     const cameraHeight = config.camera.height; // Height offset
     const cameraSmoothing = config.camera.smoothing; // Smoothing factor
+
+    // Camera height adjustment for gamepad
+    let effectiveCameraHeight = cameraHeight;
+    if (gamepadConnectedRef.current) {
+      // Lower camera height for gamepad aiming to position player lower in screen
+      effectiveCameraHeight = cameraHeight * 0.7; // Reduce height by 30%
+
+      // We also increase the vertical angle slightly to look more downward
+      // This creates the "third-person shooter" camera angle
+      mouseRef.current.y = Math.max(mouseRef.current.y, -0.1); // Ensure some downward angle
+    }
 
     // Use mouse X position to determine camera angle around character
     const cameraRotationY = -mouseRef.current.x * Math.PI;
@@ -1000,7 +1542,7 @@ const Game: React.FC = () => {
       Math.cos(cameraRotationY) * cameraDistance * Math.cos(verticalAngle);
     const idealY =
       targetPosition.y +
-      cameraHeight +
+      effectiveCameraHeight + // Use the adjusted height
       Math.sin(verticalAngle) * cameraDistance;
 
     // Apply smoothing to camera movement
@@ -1011,7 +1553,18 @@ const Game: React.FC = () => {
     cameraRef.current.position.z +=
       (idealZ - cameraRef.current.position.z) * cameraSmoothing;
 
-    // Look at character
+    // For gamepad, apply a slight shoulder offset for over-the-shoulder view
+    if (gamepadConnectedRef.current) {
+      // Add a slight horizontal offset for over-the-shoulder view
+      // This offsets the camera slightly to the right for a better shooting view
+      const shoulderOffset = config.camera.gamepadShoulderOffset; // Use the configurable value
+      cameraRef.current.position.x +=
+        Math.sin(cameraRotationY + Math.PI / 2) * shoulderOffset; // Perpendicular to look direction
+      cameraRef.current.position.z +=
+        Math.cos(cameraRotationY + Math.PI / 2) * shoulderOffset; // Perpendicular to look direction
+    }
+
+    // Look at target position
     cameraRef.current.lookAt(targetPosition);
   };
 
@@ -1389,7 +1942,6 @@ const Game: React.FC = () => {
 
           const localPlayer: Player = {
             id: newPlayerId,
-            color: localPlayerData.color,
             position: new THREE.Vector3(
               localPlayerData.position.x,
               localPlayerData.position.y,
@@ -1477,7 +2029,6 @@ const Game: React.FC = () => {
 
           const newPlayer: Player = {
             id: player.id,
-            color: player.color,
             position: new THREE.Vector3(
               player.position.x,
               player.position.y,
@@ -1579,7 +2130,6 @@ const Game: React.FC = () => {
 
         const newPlayer: Player = {
           id: data.data.id,
-          color: data.data.color,
           position: new THREE.Vector3(
             data.data.position.x,
             data.data.position.y,
@@ -1608,7 +2158,6 @@ const Game: React.FC = () => {
           // Create a new player object
           const newPlayer: Player = {
             id: data.data.id,
-            color: data.data.color || 0xff0000, // Default red
             position: new THREE.Vector3(
               data.data.position.x,
               data.data.position.y,
@@ -1880,7 +2429,6 @@ const Game: React.FC = () => {
       console.log("Creating new player for ID:", data.id);
       const newPlayer: Player = {
         id: data.id,
-        color: data.color || 0xff0000, // Default red color
         position: new THREE.Vector3(
           data.position.x,
           data.position.y,
@@ -2188,21 +2736,8 @@ const Game: React.FC = () => {
         console.log(`Model loaded successfully for player ${player.id}`);
         const model = gltf.scene;
 
-        // Apply player color to the model
-        model.traverse((child) => {
-          if (child instanceof THREE.Mesh && child.material) {
-            if (Array.isArray(child.material)) {
-              child.material = child.material.map((m) => {
-                const newMaterial = m.clone();
-                newMaterial.color.setHex(player.color);
-                return newMaterial;
-              });
-            } else {
-              child.material = child.material.clone();
-              child.material.color.setHex(player.color);
-            }
-          }
-        });
+        // No material modifications whatsoever - use materials exactly as they are in the model
+        // Do not clone, modify colors, or add userData
 
         // Scale and position the model
         model.scale.set(0.02, 0.02, 0.02);
@@ -2756,20 +3291,38 @@ const Game: React.FC = () => {
     // Create a raycaster from the camera through the cursor position
     const raycaster = new THREE.Raycaster();
 
-    // Convert normalized coordinates to raycaster format (-1 to 1)
-    raycaster.setFromCamera(
-      new THREE.Vector2(mouseRef.current.x, mouseRef.current.y),
-      cameraRef.current
-    );
+    // If gamepad is connected, aim directly forward from camera
+    // This gives us a centered crosshair aim for gamepad controls
+    if (gamepadConnectedRef.current) {
+      // Use center of screen for gamepad aiming (simulates fixed crosshair)
+      raycaster.setFromCamera(new THREE.Vector2(0, 0), cameraRef.current);
 
-    // Calculate the direction vector
-    const direction = raycaster.ray.direction.clone();
+      // For gamepad, we'll make the shots more level to help with aiming
+      // Since we've adjusted the camera to be higher, we need to compensate
+      const direction = raycaster.ray.direction.clone();
 
-    // Maintain the horizontal direction but reduce vertical component
-    direction.y *= 0.3; // Reduce vertical component to make shots more level
-    direction.normalize();
+      // With our over-the-shoulder view, we need to level out shots more
+      // This makes it easier to hit targets at the center of the screen
+      direction.y *= 0.2; // Further reduce vertical component for gamepad aiming
+      direction.normalize();
 
-    return direction;
+      return direction;
+    } else {
+      // For mouse, use the actual cursor position
+      raycaster.setFromCamera(
+        new THREE.Vector2(mouseRef.current.x, mouseRef.current.y),
+        cameraRef.current
+      );
+
+      // Calculate the direction vector
+      const direction = raycaster.ray.direction.clone();
+
+      // Maintain the horizontal direction but reduce vertical component
+      direction.y *= 0.3; // Reduce vertical component to make shots more level
+      direction.normalize();
+
+      return direction;
+    }
   };
 
   // Create a burst effect at the fireball's starting position
@@ -2865,26 +3418,6 @@ const Game: React.FC = () => {
     animateFlash();
   };
 
-  // Function to set the player color
-  const setPlayerColor = (color: THREE.Color) => {
-    playerColorRef.current = color;
-
-    // Apply to model if it's already loaded
-    if (modelRef.current) {
-      modelRef.current.traverse((child) => {
-        if (child instanceof THREE.Mesh && child.material) {
-          if (Array.isArray(child.material)) {
-            child.material.forEach((material) => {
-              material.color.copy(color);
-            });
-          } else {
-            child.material.color.copy(color);
-          }
-        }
-      });
-    }
-  };
-
   // Function to create and shoot a fireball directly to cursor position
   const fireFireball = () => {
     if (!modelRef.current || !sceneRef.current || !cameraRef.current) return;
@@ -2926,12 +3459,41 @@ const Game: React.FC = () => {
       }
     }
 
+    // Check if we're using gamepad controls
+    const usingGamepad = gamepadConnectedRef.current;
+
+    // Flash the crosshair when firing with gamepad for visual feedback
+    if (usingGamepad) {
+      const crosshair = document.querySelector("[data-crosshair]");
+      if (crosshair instanceof HTMLElement) {
+        // Create and apply a flash animation
+        crosshair.style.transform = "translate(-50%, -50%) scale(1.5)";
+        crosshair.style.filter = "brightness(2) drop-shadow(0 0 5px #ff3300)";
+
+        // Reset after animation
+        setTimeout(() => {
+          if (crosshair) {
+            crosshair.style.transform = "translate(-50%, -50%)";
+            crosshair.style.filter = "";
+          }
+        }, 150);
+      }
+    }
+
     // IMPROVED AIMING: Use the camera's exact ray for perfect aiming
     const raycaster = new THREE.Raycaster();
-    raycaster.setFromCamera(
-      new THREE.Vector2(mouseRef.current.x, mouseRef.current.y),
-      cameraRef.current
-    );
+
+    // If using gamepad, always fire at the center of the screen
+    if (usingGamepad) {
+      // With gamepad, we use a fixed crosshair in the center of the screen
+      raycaster.setFromCamera(new THREE.Vector2(0, 0), cameraRef.current);
+    } else {
+      // With mouse, use the actual cursor position
+      raycaster.setFromCamera(
+        new THREE.Vector2(mouseRef.current.x, mouseRef.current.y),
+        cameraRef.current
+      );
+    }
 
     // Find where the ray intersects with objects or extends into the distance
     let targetPoint = new THREE.Vector3();
@@ -3267,6 +3829,7 @@ const Game: React.FC = () => {
     renderer.sortObjects = true; // Enable manual sorting
     renderer.autoClear = true;
     renderer.setClearColor(0x87ceeb, 1); // Sky blue background
+    renderer.outputColorSpace = THREE.SRGBColorSpace; // Ensure proper color space
     containerRef.current.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
@@ -3283,20 +3846,14 @@ const Game: React.FC = () => {
     directionalLight.castShadow = false;
     scene.add(directionalLight);
 
-    // Ground plane
-    const planeGeometry = new THREE.PlaneGeometry(100, 100);
-    const planeMaterial = new THREE.MeshStandardMaterial({
-      color: 0x808080,
-      side: THREE.DoubleSide,
-    });
-    const plane = new THREE.Mesh(planeGeometry, planeMaterial);
-    plane.rotation.x = -Math.PI / 2;
-    plane.position.y = 0;
-    plane.receiveShadow = true;
-    plane.userData.ground = true;
-    scene.add(plane);
+    // Add a hemisphere light for better ground illumination
+    const hemisphereLight = new THREE.HemisphereLight(0xffffff, 0x444444, 0.8);
+    scene.add(hemisphereLight);
 
-    // Add environment elements
+    // We'll skip creating the default ground plane here
+    // since we'll create a textured one in createEnvironment
+
+    // Add environment elements with textured ground
     createEnvironment(scene);
 
     // Load all animation models and extract animations
@@ -3330,6 +3887,9 @@ const Game: React.FC = () => {
       requestAnimationFrame(animate);
 
       const delta = clockRef.current.getDelta();
+
+      // Check for gamepad input
+      handleGamepadInput();
 
       // Update cursor world position
       updateCursorWorldPosition();
@@ -3586,52 +4146,51 @@ const Game: React.FC = () => {
     }
   };
 
-  // Function to add hit effect (red flash) to a player
+  // Function to add hit effect (red flash) to a player without modifying materials
   const addHitEffect = (player: Player) => {
     if (!player.model) return;
 
-    // Flash the player model red
-    player.model.traverse((child) => {
-      if (child instanceof THREE.Mesh && child.material) {
-        if (Array.isArray(child.material)) {
-          child.material.forEach((mat) => {
-            // Store original color if not already stored
-            if (!mat.userData.originalColor) {
-              mat.userData.originalColor = mat.color.clone();
-            }
-            // Set to red
-            mat.color.set(0xff0000);
-          });
-        } else {
-          // Store original color if not already stored
-          if (!child.material.userData.originalColor) {
-            child.material.userData.originalColor =
-              child.material.color.clone();
-          }
-          // Set to red
-          child.material.color.set(0xff0000);
-        }
-      }
+    // Create a red sphere that envelops the player model
+    // Get the bounding box of the player model
+    const bbox = new THREE.Box3().setFromObject(player.model);
+    const size = bbox.getSize(new THREE.Vector3());
+    const center = bbox.getCenter(new THREE.Vector3());
+
+    // Create a slightly larger sphere
+    const radius = Math.max(size.x, size.y, size.z) * 0.6;
+    const geometry = new THREE.SphereGeometry(radius, 32, 32);
+    const material = new THREE.MeshBasicMaterial({
+      color: 0xff0000,
+      transparent: true,
+      opacity: 0.3,
+      side: THREE.DoubleSide,
     });
 
-    // Reset color after a short delay
-    setTimeout(() => {
-      if (player.model) {
-        player.model.traverse((child) => {
-          if (child instanceof THREE.Mesh && child.material) {
-            if (Array.isArray(child.material)) {
-              child.material.forEach((mat) => {
-                if (mat.userData.originalColor) {
-                  mat.color.copy(mat.userData.originalColor);
-                }
-              });
-            } else if (child.material.userData.originalColor) {
-              child.material.color.copy(child.material.userData.originalColor);
-            }
-          }
-        });
+    const hitEffect = new THREE.Mesh(geometry, material);
+    hitEffect.position.copy(center);
+    sceneRef.current?.add(hitEffect);
+
+    // Animate the hit effect
+    const startTime = performance.now();
+    const duration = 200; // same as the original timeout
+
+    const animateHitEffect = () => {
+      const elapsed = performance.now() - startTime;
+      const progress = elapsed / duration;
+
+      if (progress < 1 && hitEffect.parent) {
+        // Pulse the opacity
+        material.opacity = 0.3 * (1 - progress);
+        requestAnimationFrame(animateHitEffect);
+      } else {
+        // Remove when done
+        sceneRef.current?.remove(hitEffect);
+        geometry.dispose();
+        material.dispose();
       }
-    }, 200);
+    };
+
+    animateHitEffect();
   };
 
   // Add state for scoreboard visibility
@@ -4218,6 +4777,780 @@ const Game: React.FC = () => {
     }
   }, []);
 
+  // Add gamepad connection and disconnection handlers
+  useEffect(() => {
+    if (GAMEPAD_DEBUG_MODE) console.log("🎮 Setting up gamepad handlers");
+
+    const handleGamepadConnected = (e: GamepadEvent) => {
+      if (GAMEPAD_DEBUG_MODE) {
+        console.log(`Gamepad connected:`, {
+          id: e.gamepad.id,
+          index: e.gamepad.index,
+          axes: e.gamepad.axes.length,
+          buttons: e.gamepad.buttons.length,
+          mapping: e.gamepad.mapping,
+        });
+      }
+      gamepadRef.current = e.gamepad;
+      gamepadConnectedRef.current = true;
+
+      // Force re-render to update UI
+      setPlayerName((prev) => prev);
+
+      // Show a notification to the user
+      showGamepadNotification(`Gamepad connected: ${e.gamepad.id}`);
+
+      // Center the cursor/crosshair when switching to gamepad controls
+      centerCrosshair();
+    };
+
+    // Function to center the crosshair when using gamepad controls
+    const centerCrosshair = () => {
+      // Center the mouse position in normalized coordinates
+      mouseRef.current.x = 0;
+      mouseRef.current.y = 0;
+
+      // Update the pixel coordinates to the center of the screen
+      mouseRef.current.pixelX = window.innerWidth / 2;
+      mouseRef.current.pixelY = window.innerHeight / 2;
+
+      // Find and center any DOM crosshair element
+      const crosshair = document.querySelector("[data-crosshair]");
+      if (crosshair instanceof HTMLElement) {
+        crosshair.style.left = `${window.innerWidth / 2}px`;
+        crosshair.style.top = `${window.innerHeight / 2}px`;
+        crosshair.style.transform = "translate(-50%, -50%)";
+
+        // Add a subtle animation to indicate the switch to centered crosshair
+        crosshair.style.transition =
+          "transform 0.3s ease-out, filter 0.3s ease-out";
+        crosshair.style.transform = "translate(-50%, -50%) scale(1.5)";
+        crosshair.style.filter = "brightness(1.5) drop-shadow(0 0 8px #4444ff)";
+
+        // Reset after animation
+        setTimeout(() => {
+          if (crosshair) {
+            crosshair.style.transform = "translate(-50%, -50%) scale(1.0)";
+            crosshair.style.filter = "";
+          }
+        }, 300);
+      }
+    };
+
+    const handleGamepadDisconnected = (e: GamepadEvent) => {
+      if (GAMEPAD_DEBUG_MODE) {
+        console.log(`Gamepad disconnected:`, {
+          id: e.gamepad.id,
+          index: e.gamepad.index,
+        });
+      }
+      if (gamepadRef.current && gamepadRef.current.index === e.gamepad.index) {
+        gamepadRef.current = null;
+        gamepadConnectedRef.current = false;
+
+        // Force re-render to update UI
+        setPlayerName((prev) => prev);
+
+        // Show a notification to the user
+        showGamepadNotification("Gamepad disconnected");
+      }
+    };
+
+    // Function to show gamepad notifications
+    const showGamepadNotification = (message: string) => {
+      // Create notification element
+      const notification = document.createElement("div");
+      notification.style.cssText = `
+        position: fixed;
+        top: 20%;
+        left: 50%;
+        transform: translateX(-50%);
+        background-color: rgba(0, 0, 0, 0.8);
+        color: #00ff00;
+        padding: 15px 25px;
+        border-radius: 8px;
+        font-size: 18px;
+        font-weight: bold;
+        z-index: 1001;
+        box-shadow: 0 0 15px rgba(0, 255, 0, 0.5);
+        border: 1px solid #00ff00;
+        text-align: center;
+        opacity: 0;
+        transition: opacity 0.3s ease-in-out;
+      `;
+      notification.textContent = message;
+
+      // Add 🎮 emoji
+      const emoji = document.createElement("span");
+      emoji.textContent = " 🎮 ";
+      emoji.style.fontSize = "24px";
+      notification.prepend(emoji);
+
+      // Add to body
+      document.body.appendChild(notification);
+
+      // Fade in
+      setTimeout(() => {
+        notification.style.opacity = "1";
+      }, 10);
+
+      // Remove after 3 seconds
+      setTimeout(() => {
+        notification.style.opacity = "0";
+        setTimeout(() => {
+          if (document.body.contains(notification)) {
+            document.body.removeChild(notification);
+          }
+        }, 300);
+      }, 3000);
+    };
+
+    // Scan for gamepads function - this is used by both the initial scan and polling
+    const scanForGamepads = () => {
+      const gamepads = navigator.getGamepads();
+      if (GAMEPAD_DEBUG_MODE) console.log("Scanning for gamepads:", gamepads);
+
+      for (let i = 0; i < gamepads.length; i++) {
+        const pad = gamepads[i];
+        if (pad !== null) {
+          if (GAMEPAD_DEBUG_MODE)
+            console.log(`Found gamepad at index ${i}:`, pad);
+
+          // Check if this is a new gamepad or if we're already tracking it
+          if (
+            !gamepadConnectedRef.current ||
+            (gamepadRef.current && gamepadRef.current.index !== pad.index) ||
+            !gamepadRef.current
+          ) {
+            gamepadRef.current = pad;
+            gamepadConnectedRef.current = true;
+
+            // Show notification only if this is a new detection
+            showGamepadNotification(`Bluetooth gamepad detected: ${pad.id}`);
+
+            // Force re-render to update UI
+            setPlayerName((prev) => prev);
+          }
+          return true;
+        }
+      }
+      return false;
+    };
+
+    // Log available gamepads on initialization
+    if (GAMEPAD_DEBUG_MODE)
+      console.log("Checking for already connected gamepads on initialization");
+    if (!scanForGamepads() && GAMEPAD_DEBUG_MODE) {
+      console.log("No gamepads found during initial scan");
+    }
+
+    // Create a more aggressive polling mechanism specifically for Bluetooth gamepads
+    // These can sometimes be missed by normal event listeners
+    const gamepadPollInterval = setInterval(() => {
+      if (!gamepadConnectedRef.current) {
+        scanForGamepads();
+      } else {
+        // Even if we think we're connected, do a quick check that the gamepad is still there
+        // Some browsers lose track of Bluetooth gamepads
+        const gamepads = navigator.getGamepads();
+        const currentIndex = gamepadRef.current?.index ?? -1;
+
+        // Check if our current gamepad is still connected
+        if (
+          currentIndex >= 0 &&
+          (gamepads[currentIndex] === null ||
+            !gamepads[currentIndex]?.connected)
+        ) {
+          console.log(
+            "Previously connected gamepad appears to be disconnected, scanning again"
+          );
+          scanForGamepads();
+        }
+      }
+    }, 1000); // Poll every second for better Bluetooth gamepad detection
+
+    // Add special handling for Bluetooth gamepads in Safari and other browsers
+    // This helps with controllers that only register after a button press
+    const handleAnyUserInteraction = () => {
+      if (!gamepadConnectedRef.current) {
+        console.log(
+          "User interaction detected, trying to detect Bluetooth gamepads..."
+        );
+        scanForGamepads();
+      }
+    };
+
+    // Register for events that might help activate Bluetooth gamepads
+    window.addEventListener("click", handleAnyUserInteraction);
+    window.addEventListener("keydown", handleAnyUserInteraction);
+    window.addEventListener("touchstart", handleAnyUserInteraction);
+
+    window.addEventListener("gamepadconnected", handleGamepadConnected);
+    window.addEventListener("gamepaddisconnected", handleGamepadDisconnected);
+
+    // Add an instruction to press a button on the gamepad
+    console.log(
+      "🎮 If your gamepad isn't detected automatically, try pressing any button on it"
+    );
+
+    // Show a notification to help users connect Bluetooth gamepads
+    setTimeout(() => {
+      if (!gamepadConnectedRef.current) {
+        showGamepadNotification(
+          "Press buttons on your Bluetooth controller to activate it"
+        );
+      }
+    }, 2000);
+
+    return () => {
+      window.removeEventListener("gamepadconnected", handleGamepadConnected);
+      window.removeEventListener(
+        "gamepaddisconnected",
+        handleGamepadDisconnected
+      );
+      window.removeEventListener("click", handleAnyUserInteraction);
+      window.removeEventListener("keydown", handleAnyUserInteraction);
+      window.removeEventListener("touchstart", handleAnyUserInteraction);
+      clearInterval(gamepadPollInterval);
+    };
+  }, []);
+
+  // Handle gamepad input
+  const handleGamepadInput = () => {
+    // Skip if gamepad not connected
+    if (!gamepadConnectedRef.current) return;
+
+    // Get all gamepads from the browser
+    const gamepads = navigator.getGamepads();
+
+    // Ensure we have gamepads array
+    if (!gamepads) return;
+
+    // Ensure we have a gamepad reference
+    if (!gamepadConnectedRef.current || !gamepadRef.current) {
+      return;
+    }
+
+    // Get fresh gamepad state from the correct index
+    const gamepadIndex = gamepadRef.current.index;
+
+    // CRITICAL: The Gamepad API sometimes returns null even for connected gamepads
+    // We need to handle this case gracefully
+    let currentGamepad = gamepads[gamepadIndex];
+
+    // Handle the case where the gamepad reference is temporarily null
+    // but we know it's still connected (common browser bug particularly with Bluetooth)
+    if (currentGamepad === null) {
+      // Check if any of the gamepad slots have a valid gamepad
+      // This handles the case where the index might have changed
+      for (let i = 0; i < gamepads.length; i++) {
+        if (gamepads[i] !== null) {
+          if (GAMEPAD_DEBUG_MODE) {
+            console.log(
+              `Bluetooth gamepad found at different index: ${i} (was ${gamepadIndex})`
+            );
+          }
+          gamepadRef.current = gamepads[i];
+          currentGamepad = gamepads[i];
+          break;
+        }
+      }
+
+      // If we still don't have a gamepad, skip this frame but don't disconnect
+      if (currentGamepad === null) {
+        // Just log it less frequently to avoid console spam
+        if (GAMEPAD_DEBUG_MODE && Math.random() < 0.01) {
+          console.log(
+            "Bluetooth gamepad temporarily disconnected, waiting for reconnection"
+          );
+        }
+        return;
+      }
+    }
+
+    // Debug - log gamepad state periodically
+    if (GAMEPAD_DEBUG_MODE && Math.random() < 0.01) {
+      // Log roughly once every 100 frames to avoid console spam
+      console.log("Gamepad state:", {
+        id: currentGamepad.id,
+        index: currentGamepad.index,
+        connected: currentGamepad.connected,
+        mapping: currentGamepad.mapping,
+        bluetoothId: currentGamepad.id.includes("Wireless")
+          ? "Bluetooth device detected"
+          : "Wired/Unknown",
+        axes: Array.from(currentGamepad.axes).map((v) => v.toFixed(2)),
+        buttons: Array.from(currentGamepad.buttons).map((b) => ({
+          pressed: b.pressed,
+          value: b.value.toFixed(2),
+        })),
+      });
+    }
+
+    // Apply deadzone to analog stick values
+    const applyDeadzone = (value: number): number => {
+      return Math.abs(value) < gamepadDeadzoneRef.current
+        ? 0
+        : value >= 0
+        ? (value - gamepadDeadzoneRef.current) /
+          (1 - gamepadDeadzoneRef.current)
+        : (value + gamepadDeadzoneRef.current) /
+          (1 - gamepadDeadzoneRef.current);
+    };
+
+    // Determine which axes to use based on the gamepad mapping and device type
+    let leftXAxis = 0;
+    let leftYAxis = 1;
+    let rightXAxis = 2;
+    let rightYAxis = 3;
+
+    // Get the ID in lowercase for easier matching
+    const gamepadId = currentGamepad.id.toLowerCase();
+    const isBluetooth =
+      gamepadId.includes("wireless") ||
+      gamepadId.includes("bluetooth") ||
+      gamepadId.includes("le") || // Bluetooth LE
+      gamepadId.includes("dualsock") ||
+      gamepadId.includes("dualsense");
+
+    // Some Bluetooth controllers have special needs
+    if (isBluetooth) {
+      if (GAMEPAD_DEBUG_MODE) {
+        console.log("Using Bluetooth controller handling for:", gamepadId);
+      }
+
+      // Different Bluetooth controllers
+      if (gamepadId.includes("xbox")) {
+        // Bluetooth Xbox controller mapping
+        leftXAxis = 0;
+        leftYAxis = 1;
+        rightXAxis = 2;
+        rightYAxis = 3;
+      } else if (
+        gamepadId.includes("dualshock") ||
+        gamepadId.includes("dualsense") ||
+        gamepadId.includes("playstation")
+      ) {
+        // PlayStation controller over Bluetooth
+        leftXAxis = 0;
+        leftYAxis = 1;
+        rightXAxis = 2;
+        rightYAxis = 3;
+
+        // Some browsers report different mappings for PlayStation controllers
+        if (currentGamepad.axes.length >= 6) {
+          console.log("Using 6-axis mapping for PlayStation controller");
+          leftXAxis = 0;
+          leftYAxis = 1;
+          rightXAxis = 3;
+          rightYAxis = 4;
+        }
+      } else if (
+        gamepadId.includes("nintendo") ||
+        gamepadId.includes("switch")
+      ) {
+        // Nintendo controllers over Bluetooth
+        leftXAxis = 0;
+        leftYAxis = 1;
+        rightXAxis = 2;
+        rightYAxis = 3;
+      } else if (currentGamepad.axes.length >= 4) {
+        // Generic Bluetooth controller with enough axes
+        console.log(
+          `Using default mapping for unknown Bluetooth controller: "${gamepadId}" with ${currentGamepad.axes.length} axes`
+        );
+        leftXAxis = 0;
+        leftYAxis = 1;
+        rightXAxis = 2;
+        rightYAxis = 3;
+      } else {
+        console.log(
+          `Unknown Bluetooth controller with too few axes: "${gamepadId}" (${currentGamepad.axes.length} axes)`
+        );
+      }
+    } else if (currentGamepad.mapping !== "standard") {
+      // Handle non-standard wired controllers
+      if (gamepadId.includes("xbox") || gamepadId.includes("xinput")) {
+        // Standard Xbox controller mapping
+        leftXAxis = 0;
+        leftYAxis = 1;
+        rightXAxis = 2;
+        rightYAxis = 3;
+      } else if (
+        gamepadId.includes("playstation") ||
+        gamepadId.includes("dualshock") ||
+        gamepadId.includes("ps4") ||
+        gamepadId.includes("ps5")
+      ) {
+        // Typical PlayStation controller mapping
+        leftXAxis = 0;
+        leftYAxis = 1;
+        rightXAxis = 2;
+        rightYAxis = 3;
+      }
+      // Safari on macOS might have different mappings
+      else if (
+        gamepadId.includes("wireless controller") &&
+        /safari/i.test(navigator.userAgent)
+      ) {
+        leftXAxis = 0;
+        leftYAxis = 1;
+        rightXAxis = 2;
+        rightYAxis = 3;
+      }
+      // Generic controllers on different browsers
+      else if (currentGamepad.axes.length >= 4) {
+        // Just use the first 4 axes in the common layout
+        leftXAxis = 0;
+        leftYAxis = 1;
+        rightXAxis = 2;
+        rightYAxis = 3;
+        console.log(
+          `Using default axis mapping for unknown controller: "${gamepadId}"`
+        );
+      } else {
+        console.log(
+          `Unknown controller with too few axes: "${gamepadId}" (${currentGamepad.axes.length} axes)`
+        );
+      }
+    }
+
+    // If it's a Bluetooth controller, add an extra logging message
+    if (isBluetooth) {
+      console.log(
+        `Using Bluetooth controller mapping: left(${leftXAxis},${leftYAxis}), right(${rightXAxis},${rightYAxis})`
+      );
+    }
+
+    // Make sure the axes exist before using them
+    const hasLeftStick =
+      currentGamepad.axes.length > Math.max(leftXAxis, leftYAxis);
+    const hasRightStick =
+      currentGamepad.axes.length > Math.max(rightXAxis, rightYAxis);
+
+    // Left stick for movement (if available)
+    if (hasLeftStick) {
+      const leftX = applyDeadzone(currentGamepad.axes[leftXAxis]);
+      const leftY = applyDeadzone(currentGamepad.axes[leftYAxis]);
+
+      // Set movement based on left stick
+      const prevMovement = {
+        left: movementRef.current.left,
+        right: movementRef.current.right,
+        forward: movementRef.current.forward,
+        backward: movementRef.current.backward,
+      };
+
+      // Some Bluetooth controllers have inverted Y axis
+      const invertY =
+        isBluetooth &&
+        (gamepadId.includes("dualshock") ||
+          gamepadId.includes("dualsense") ||
+          gamepadId.includes("playstation"));
+
+      // Apply inverted Y axis for some controllers if needed
+      movementRef.current.left = leftX < -0.2;
+      movementRef.current.right = leftX > 0.2;
+
+      // Handle potentially inverted Y axis
+      if (invertY) {
+        movementRef.current.forward = leftY > 0.2;
+        movementRef.current.backward = leftY < -0.2;
+      } else {
+        movementRef.current.forward = leftY < -0.2;
+        movementRef.current.backward = leftY > 0.2;
+      }
+
+      // Log movement changes from gamepad
+      if (
+        prevMovement.left !== movementRef.current.left ||
+        prevMovement.right !== movementRef.current.right ||
+        prevMovement.forward !== movementRef.current.forward ||
+        prevMovement.backward !== movementRef.current.backward
+      ) {
+        console.log("Gamepad movement updated:", {
+          left: movementRef.current.left,
+          right: movementRef.current.right,
+          forward: movementRef.current.forward,
+          backward: movementRef.current.backward,
+          leftStick: { x: leftX.toFixed(2), y: leftY.toFixed(2) },
+          inverted: invertY,
+        });
+      }
+    }
+
+    // Right stick for camera/aiming (if available)
+    if (hasRightStick) {
+      const rightX = applyDeadzone(currentGamepad.axes[rightXAxis]);
+      const rightY = applyDeadzone(currentGamepad.axes[rightYAxis]);
+
+      if (Math.abs(rightX) > 0 || Math.abs(rightY) > 0) {
+        // For gamepad, we'll rotate the camera instead of moving the cursor
+        // This creates a more console-like control scheme with centered crosshair
+
+        // Create a gamepad camera rotation speed variable
+        const gamepadRotationSpeed = 2.5; // Adjust this value to change rotation speed
+
+        // Update the camera rotation based on the right stick input
+        // This is equivalent to moving the mouse, but we're directly changing the view angle
+        if (Math.abs(rightX) > 0) {
+          const rotationAmount = rightX * gamepadRotationSpeed * 0.05;
+
+          // Adjust the look direction based on right stick X axis
+          // This uses the existing camera system by simulating a mouse movement
+          // but we're keeping the cursor centered
+          mouseRef.current.x += rotationAmount;
+
+          // Log camera rotation changes occasionally
+          if (Math.random() < 0.02) {
+            console.log("Gamepad camera rotation (X):", rotationAmount);
+          }
+        }
+
+        // Vertical camera adjustment with the right stick
+        if (Math.abs(rightY) > 0) {
+          const verticalAmount = rightY * gamepadRotationSpeed * 0.03;
+
+          // Adjust the vertical look with constraints to prevent flipping
+          mouseRef.current.y = Math.max(
+            -0.9,
+            Math.min(0.9, mouseRef.current.y + verticalAmount)
+          );
+
+          // Log vertical adjustments occasionally
+          if (Math.random() < 0.02) {
+            console.log("Gamepad camera vertical:", mouseRef.current.y);
+          }
+        }
+
+        // When using a gamepad, we keep the crosshair centered rather than moving it
+        // Update the pixel coordinates to the center of the screen for any UI elements
+        mouseRef.current.pixelX = window.innerWidth / 2;
+        mouseRef.current.pixelY = window.innerHeight / 2;
+
+        // Also center any DOM crosshair element
+        const crosshair = document.querySelector("[data-crosshair]");
+        if (crosshair instanceof HTMLElement) {
+          crosshair.style.left = `${window.innerWidth / 2}px`;
+          crosshair.style.top = `${window.innerHeight / 2}px`;
+        }
+
+        if (Math.random() < 0.05) {
+          // Log occasionally to avoid console spam
+          console.log("Gamepad camera update:", {
+            rightStick: { x: rightX.toFixed(2), y: rightY.toFixed(2) },
+            lookDirection: {
+              x: mouseRef.current.x.toFixed(2),
+              y: mouseRef.current.y.toFixed(2),
+            },
+          });
+        }
+      }
+    }
+
+    // Determine button mappings based on controller type
+    let jumpButtonIndex = 0; // Default A/Cross button
+    let fireButton1Index = 7; // Default RT/R2 button
+    let fireButton2Index = 5; // Default RB/R1 button
+    let scoreButton1Index = 8; // Default Back/Select button
+    let scoreButton2Index = 9; // Default Start button
+
+    // Adjust button indices for different controllers
+    if (isBluetooth) {
+      // Bluetooth controllers often have different mappings
+      if (gamepadId.includes("xbox")) {
+        // Bluetooth Xbox controller
+        jumpButtonIndex = 0; // A
+        fireButton1Index = 7; // RT
+        fireButton2Index = 5; // RB
+        scoreButton1Index = 8; // Back/View
+        scoreButton2Index = 9; // Start/Menu
+      } else if (
+        gamepadId.includes("playstation") ||
+        gamepadId.includes("dualshock") ||
+        gamepadId.includes("dualsense")
+      ) {
+        // Bluetooth PlayStation controller
+        jumpButtonIndex = 0; // Cross
+        fireButton1Index = 7; // R2
+        fireButton2Index = 5; // R1
+        scoreButton1Index = 8; // Select/Share
+        scoreButton2Index = 9; // Options/Start
+
+        // Some PS controllers use different mappings on different browsers
+        if (currentGamepad.buttons.length >= 17) {
+          console.log("Using extended mapping for PlayStation controller");
+          jumpButtonIndex = 0; // Cross
+          fireButton1Index = 7; // R2
+          fireButton2Index = 5; // R1
+          scoreButton1Index = 8; // Share/Select
+          scoreButton2Index = 9; // Options/Start
+        }
+      } else if (
+        gamepadId.includes("nintendo") ||
+        gamepadId.includes("switch")
+      ) {
+        // Bluetooth Nintendo controller
+        jumpButtonIndex = 0; // B/A (depends on controller)
+        fireButton1Index = 7; // ZR
+        fireButton2Index = 5; // R
+        scoreButton1Index = 8; // Minus
+        scoreButton2Index = 9; // Plus
+      } else {
+        // Generic Bluetooth controller - try common mappings
+        console.log(
+          `Using default button mapping for Bluetooth controller: "${gamepadId}"`
+        );
+        // Try to locate jump button (usually first button)
+        jumpButtonIndex = 0;
+        // Try to locate trigger buttons (usually high indices)
+        if (currentGamepad.buttons.length >= 8) {
+          fireButton1Index = 7;
+          fireButton2Index = 5;
+        } else if (currentGamepad.buttons.length >= 6) {
+          fireButton1Index = 5;
+          fireButton2Index = 4;
+        } else {
+          fireButton1Index = 1;
+          fireButton2Index = 2;
+        }
+        // Try to locate menu buttons
+        if (currentGamepad.buttons.length >= 10) {
+          scoreButton1Index = 8;
+          scoreButton2Index = 9;
+        } else {
+          scoreButton1Index = 3;
+          scoreButton2Index = 3;
+        }
+      }
+    } else if (currentGamepad.mapping !== "standard") {
+      // Non-Bluetooth, non-standard controllers
+      if (gamepadId.includes("xbox") || gamepadId.includes("xinput")) {
+        // Use standard Xbox mapping
+        jumpButtonIndex = 0; // A
+        fireButton1Index = 7; // RT
+        fireButton2Index = 5; // RB
+        scoreButton1Index = 8; // Back
+        scoreButton2Index = 9; // Start
+      } else if (
+        gamepadId.includes("playstation") ||
+        gamepadId.includes("dualshock") ||
+        gamepadId.includes("ps4") ||
+        gamepadId.includes("ps5")
+      ) {
+        jumpButtonIndex = 0; // Cross
+        fireButton1Index = 7; // R2
+        fireButton2Index = 5; // R1
+        scoreButton1Index = 8; // Share/Select
+        scoreButton2Index = 9; // Options/Start
+      } else {
+        // Generic controllers - try common mappings
+        console.log(`Using default button mapping for: "${gamepadId}"`);
+      }
+    }
+
+    // Safety check to make sure button indices are within bounds
+    const buttonCount = currentGamepad ? currentGamepad.buttons.length : 0;
+    const safeGetButton = (index: number) => {
+      return currentGamepad && index < buttonCount
+        ? currentGamepad.buttons[index]
+        : { pressed: false, value: 0 };
+    };
+
+    const jumpButton = safeGetButton(jumpButtonIndex);
+    const fireButton1 = safeGetButton(fireButton1Index);
+    const fireButton2 = safeGetButton(fireButton2Index);
+    const scoreButton1 = safeGetButton(scoreButton1Index);
+    const scoreButton2 = safeGetButton(scoreButton2Index);
+
+    // Try all buttons for jump if we need to (useful for debugging and for Bluetooth controllers)
+    let jumpPressed = jumpButton.pressed;
+
+    // For Bluetooth controllers, check additional buttons that might be used for jump
+    if (!jumpPressed && isBluetooth && currentGamepad.buttons.length > 1) {
+      // Check other common jump buttons depending on controller
+      if (
+        gamepadId.includes("playstation") ||
+        gamepadId.includes("dualshock")
+      ) {
+        // On PlayStation controllers, Circle (button 1) or X (button 2) might be used
+        jumpPressed =
+          currentGamepad.buttons[1].pressed ||
+          currentGamepad.buttons[2].pressed;
+      } else if (
+        gamepadId.includes("nintendo") ||
+        gamepadId.includes("switch")
+      ) {
+        // On Nintendo controllers, A (button 1) or B (button 0) might be used
+        jumpPressed =
+          currentGamepad.buttons[0].pressed ||
+          currentGamepad.buttons[1].pressed;
+      } else {
+        // Generic controller - try a few common buttons
+        // The second button (B on Xbox, Circle on PS) is sometimes also used for jump
+        jumpPressed = currentGamepad.buttons[1].pressed;
+
+        // If we have enough buttons, also try the X button (Xbox) or Square (PS)
+        if (!jumpPressed && currentGamepad.buttons.length > 2) {
+          jumpPressed = currentGamepad.buttons[2].pressed;
+        }
+      }
+    }
+
+    // Jump with button
+    if (jumpPressed && movementRef.current.canJump) {
+      if (GAMEPAD_DEBUG_MODE) {
+        console.log("Gamepad jump button pressed");
+      }
+      // Apply jump physics
+      const jumpVelocity = 7;
+      movementRef.current.velocity.y = jumpVelocity;
+      movementRef.current.jumping = true;
+      movementRef.current.canJump = false;
+      setAnimation("jump");
+    }
+
+    // For Bluetooth controllers, try all trigger/shoulder buttons for fire
+    let firePressed = fireButton1.pressed || fireButton2.pressed;
+
+    // For Bluetooth controllers, try more buttons for fire
+    if (!firePressed && isBluetooth && currentGamepad.buttons.length > 4) {
+      // Try L1/L2 as well (buttons 4/6) in case R1/R2 aren't detected correctly
+      if (currentGamepad.buttons.length > 6) {
+        firePressed =
+          currentGamepad.buttons[4].pressed ||
+          currentGamepad.buttons[6].pressed;
+      }
+      // Or just try buttons 3 and 4 for smaller button sets
+      else {
+        firePressed =
+          currentGamepad.buttons[3].pressed ||
+          currentGamepad.buttons[4].pressed;
+      }
+    }
+
+    // Fire with primary or secondary fire buttons
+    const now = Date.now();
+    if (
+      firePressed &&
+      now - gamepadLastFireballTimeRef.current > gamepadFireRateRef.current
+    ) {
+      if (GAMEPAD_DEBUG_MODE) {
+        console.log("Gamepad fire button pressed");
+      }
+      fireFireball();
+      gamepadLastFireballTimeRef.current = now;
+    }
+
+    // Toggle scoreboard with select/back or start
+    const scoreboardVisible = scoreButton1.pressed || scoreButton2.pressed;
+    if (scoreboardVisible) {
+      setShowScoreboard(true);
+    } else {
+      setShowScoreboard(false);
+    }
+  };
+
   // Return the JSX
   return (
     <div
@@ -4232,6 +5565,17 @@ const Game: React.FC = () => {
         cursor: "none",
       }}
     >
+      {/* CSS for gamepad animation */}
+      <style>
+        {`
+          @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.7; }
+            100% { opacity: 1; }
+          }
+        `}
+      </style>
+
       {/* Player Name Menu */}
       {(showNameMenu || isRespawning) && (
         <div
@@ -4385,7 +5729,7 @@ const Game: React.FC = () => {
         </div>
       )}
 
-      {/* Keep existing UI elements */}
+      {/* Controls */}
       <div
         style={{
           position: "absolute",
@@ -4396,6 +5740,7 @@ const Game: React.FC = () => {
           padding: "10px",
           borderRadius: "5px",
           maxWidth: "300px",
+          zIndex: 1000,
         }}
       >
         <h3 style={{ margin: "0 0 10px 0" }}>Controls:</h3>
@@ -4405,6 +5750,303 @@ const Game: React.FC = () => {
         <p style={{ margin: "5px 0" }}>Mouse - Camera</p>
         <p style={{ margin: "5px 0" }}>Left Click/F - Shoot Fireball</p>
         <p style={{ margin: "5px 0" }}>Tab - Show Scoreboard (Hold)</p>
+
+        {/* Gamepad indicator */}
+        {gamepadConnectedRef.current && (
+          <>
+            <h3 style={{ margin: "10px 0 5px 0" }}>Gamepad Controls:</h3>
+            <p style={{ margin: "5px 0" }}>Left Stick - Move</p>
+            <p style={{ margin: "5px 0" }}>Right Stick - Camera Control</p>
+            <p style={{ margin: "5px 0" }}>A Button - Jump</p>
+            <p style={{ margin: "5px 0" }}>RT/RB - Shoot Fireball</p>
+            <p style={{ margin: "5px 0" }}>Start/Select - Scoreboard (Hold)</p>
+            <div
+              style={{
+                marginTop: "10px",
+                backgroundColor: "rgba(50,205,50,0.7)",
+                color: "white",
+                padding: "8px",
+                borderRadius: "4px",
+                fontWeight: "bold",
+                textAlign: "center",
+                boxShadow: "0 0 5px rgba(0,255,0,0.5)",
+                animation: "pulse 2s infinite",
+              }}
+            >
+              🎮 Controller Connected
+            </div>
+            <div
+              style={{
+                marginTop: "8px",
+                backgroundColor: "rgba(90,120,255,0.7)",
+                color: "white",
+                padding: "8px",
+                borderRadius: "4px",
+                fontWeight: "bold",
+                textAlign: "center",
+                fontSize: "12px",
+              }}
+            >
+              Console-Style Controls Enabled
+            </div>
+          </>
+        )}
+
+        {/* Debug info for gamepad - Only visible in debug mode */}
+        {GAMEPAD_DEBUG_MODE && (
+          <div
+            style={{
+              marginTop: "15px",
+              backgroundColor: "rgba(0,0,0,0.7)",
+              color: "#00ff00",
+              padding: "8px",
+              borderRadius: "4px",
+              fontSize: "12px",
+              fontFamily: "monospace",
+              boxShadow: "0 0 10px rgba(0,0,0,0.7)",
+              border: "1px solid #444",
+            }}
+          >
+            <div style={{ fontWeight: "bold", marginBottom: "5px" }}>
+              🎮 Gamepad Debug:
+            </div>
+            <div>Connected: {gamepadConnectedRef.current ? "Yes" : "No"}</div>
+            <div>ID: {gamepadRef.current?.id || "None"}</div>
+            <div>Mapping: {gamepadRef.current?.mapping || "None"}</div>
+            <div>Buttons: {gamepadRef.current?.buttons.length || 0}</div>
+            <div>Axes: {gamepadRef.current?.axes.length || 0}</div>
+            <div
+              style={{
+                display: "flex",
+                gap: "4px",
+                marginTop: "8px",
+              }}
+            >
+              <button
+                style={{
+                  backgroundColor: "#444",
+                  color: "white",
+                  border: "none",
+                  padding: "4px 8px",
+                  borderRadius: "3px",
+                  cursor: "pointer",
+                  fontSize: "10px",
+                  flex: 1,
+                }}
+                onClick={() => {
+                  // Force scan for gamepads
+                  const gamepads = navigator.getGamepads();
+                  if (GAMEPAD_DEBUG_MODE)
+                    console.log("Manual gamepad scan:", gamepads);
+
+                  // Try to connect to any gamepad found
+                  for (let i = 0; i < gamepads.length; i++) {
+                    const pad = gamepads[i];
+                    if (pad !== null) {
+                      if (GAMEPAD_DEBUG_MODE) {
+                        console.log(`Found gamepad at index ${i}:`, pad);
+                      }
+                      gamepadRef.current = pad;
+                      gamepadConnectedRef.current = true;
+
+                      // Force component to re-render to update debug info
+                      setPlayerName(playerName);
+
+                      alert(`Gamepad connected: ${pad.id}`);
+                      return;
+                    }
+                  }
+
+                  alert(
+                    "No gamepads found. Make sure your controller is connected and try pressing a button on it."
+                  );
+                }}
+              >
+                Scan for Gamepads
+              </button>
+              <button
+                style={{
+                  backgroundColor: "#2a5",
+                  color: "white",
+                  border: "none",
+                  padding: "4px 8px",
+                  borderRadius: "3px",
+                  cursor: "pointer",
+                  fontSize: "10px",
+                  flex: 1,
+                }}
+                onClick={() => {
+                  // Create a test input modal
+                  const modal = document.createElement("div");
+                  modal.style.cssText = `
+                    position: fixed;
+                    top: 0;
+                    left: 0;
+                    width: 100%;
+                    height: 100%;
+                    background-color: rgba(0, 0, 0, 0.85);
+                    display: flex;
+                    flex-direction: column;
+                    justify-content: center;
+                    align-items: center;
+                    z-index: 1002;
+                    font-family: monospace;
+                    color: white;
+                  `;
+
+                  // Title
+                  const title = document.createElement("h2");
+                  title.textContent = "Controller Test Mode";
+                  title.style.color = "#00ff00";
+                  modal.appendChild(title);
+
+                  // Instructions
+                  const instructions = document.createElement("p");
+                  instructions.textContent =
+                    "Press any button or move any stick on your controller";
+                  instructions.style.marginBottom = "20px";
+                  modal.appendChild(instructions);
+
+                  // Create input display areas
+                  const display = document.createElement("div");
+                  display.style.width = "80%";
+                  display.style.maxWidth = "500px";
+                  display.style.marginBottom = "20px";
+
+                  // Buttons display
+                  const buttonsDisplay = document.createElement("div");
+                  buttonsDisplay.style.cssText = `
+                    background-color: rgba(50, 50, 50, 0.6);
+                    border-radius: 4px;
+                    padding: 10px;
+                    margin-bottom: 10px;
+                  `;
+                  buttonsDisplay.innerHTML =
+                    "<h3>Buttons:</h3><div id='buttons-info'>No input yet</div>";
+
+                  // Axes display
+                  const axesDisplay = document.createElement("div");
+                  axesDisplay.style.cssText = `
+                    background-color: rgba(50, 50, 50, 0.6);
+                    border-radius: 4px;
+                    padding: 10px;
+                  `;
+                  axesDisplay.innerHTML =
+                    "<h3>Axes:</h3><div id='axes-info'>No input yet</div>";
+
+                  display.appendChild(buttonsDisplay);
+                  display.appendChild(axesDisplay);
+                  modal.appendChild(display);
+
+                  // Close button
+                  const closeButton = document.createElement("button");
+                  closeButton.textContent = "Close";
+                  closeButton.style.cssText = `
+                    padding: 8px 20px;
+                    background-color: #f44;
+                    color: white;
+                    border: none;
+                    border-radius: 4px;
+                    cursor: pointer;
+                    margin-top: 20px;
+                    font-size: 14px;
+                  `;
+                  closeButton.onclick = () => {
+                    document.body.removeChild(modal);
+                    testMode = false;
+                  };
+                  modal.appendChild(closeButton);
+
+                  document.body.appendChild(modal);
+
+                  // Set up gamepad polling
+                  const buttonsInfo = document.getElementById("buttons-info");
+                  const axesInfo = document.getElementById("axes-info");
+
+                  let testMode = true;
+
+                  // Function to update the display
+                  const updateDisplay = () => {
+                    if (!testMode) return;
+
+                    const gamepads = navigator.getGamepads();
+                    let anyGamepad = null;
+
+                    // Find a gamepad
+                    for (let i = 0; i < gamepads.length; i++) {
+                      if (gamepads[i]) {
+                        anyGamepad = gamepads[i];
+                        break;
+                      }
+                    }
+
+                    if (!buttonsInfo || !axesInfo) {
+                      console.error(
+                        "Could not find buttons or axes info elements"
+                      );
+                      return;
+                    }
+
+                    if (anyGamepad) {
+                      // Update buttons
+                      let buttonsHtml = "";
+                      for (let i = 0; i < anyGamepad.buttons.length; i++) {
+                        const button = anyGamepad.buttons[i];
+                        const isPressed = button.pressed || button.value > 0.1;
+                        const color = isPressed ? "#00ff00" : "#777";
+                        buttonsHtml += `<div style="margin: 5px 0; color: ${color}">Button ${i}: ${
+                          isPressed ? "PRESSED" : "released"
+                        } (${button.value.toFixed(2)})</div>`;
+                      }
+                      buttonsInfo.innerHTML =
+                        buttonsHtml || "No buttons detected";
+
+                      // Update axes
+                      let axesHtml = "";
+                      for (let i = 0; i < anyGamepad.axes.length; i++) {
+                        const value = anyGamepad.axes[i];
+                        const absValue = Math.abs(value);
+                        const color = absValue > 0.1 ? "#00ff00" : "#777";
+                        const barWidth = Math.abs(value * 100);
+                        axesHtml += `
+                          <div style="margin: 10px 0;">
+                            <div style="color: ${color}">Axis ${i}: ${value.toFixed(
+                          2
+                        )}</div>
+                            <div style="width: 100%; background-color: #333; height: 10px; border-radius: 5px; position: relative;">
+                              <div style="position: absolute; top: 0; left: 50%; width: 2px; height: 100%; background-color: #aaa;"></div>
+                              <div style="
+                                position: absolute; 
+                                top: 0; 
+                                ${value < 0 ? "right: 50%;" : "left: 50%;"} 
+                                width: ${barWidth}%; 
+                                height: 100%; 
+                                background-color: ${color};
+                                border-radius: 5px;
+                              "></div>
+                            </div>
+                          </div>
+                        `;
+                      }
+                      axesInfo.innerHTML = axesHtml || "No axes detected";
+                    } else {
+                      buttonsInfo.innerHTML = "No gamepad connected";
+                      axesInfo.innerHTML = "No gamepad connected";
+                    }
+
+                    // Continue the animation loop
+                    requestAnimationFrame(updateDisplay);
+                  };
+
+                  // Start the animation loop
+                  updateDisplay();
+                }}
+              >
+                Test Controller
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Add coin counter display */}
@@ -4442,6 +6084,8 @@ const Game: React.FC = () => {
 
       {/* Render scoreboard */}
       {renderScoreboard()}
+
+      {/* ... rest of existing UI ... */}
     </div>
   );
 };
