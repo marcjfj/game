@@ -5,6 +5,7 @@ import React, { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { initControlPanel, getConfig } from "./ControlPanel";
 
 // Constants for player health
 const MAX_PLAYER_HEALTH = 100;
@@ -48,11 +49,15 @@ interface Player {
   healthBar?: HTMLDivElement;
   healthBarForeground?: HTMLDivElement;
   lastHitTime?: number;
+  jumpStartTime?: number;
+  kills: number;
+  deaths: number;
+  name: string; // Add name property
 }
 
 console.log("Loading models from", window.location.origin);
 
-// Define speed constants
+// Define speed constants - these will be overridden by the control panel
 const WALK_SPEED = 2;
 const RUN_SPEED = 8; // Increased from 5 to 8 for faster running movement
 
@@ -63,6 +68,11 @@ const Game: React.FC = () => {
     isRunning: false,
     isJumping: false,
   });
+
+  // Add state for player name menu
+  const [showNameMenu, setShowNameMenu] = useState(true); // Show menu on initial load
+  const [playerName, setPlayerName] = useState("");
+  const [isRespawning, setIsRespawning] = useState(false);
 
   const mouseRef = useRef({
     x: 0,
@@ -81,6 +91,9 @@ const Game: React.FC = () => {
   const lastFireballTimeRef = useRef<number>(0); // Time of last fireball
   const fireballCooldownRef = useRef<number>(0.4); // Reduced cooldown for faster firing
 
+  // Add control panel ref
+  const controlPanelRef = useRef<any>(null);
+
   const containerRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
@@ -88,6 +101,7 @@ const Game: React.FC = () => {
   const modelRef = useRef<THREE.Object3D | null>(null);
   const mixerRef = useRef<THREE.AnimationMixer | null>(null);
   const actionsRef = useRef<{ [key: string]: THREE.AnimationAction }>({});
+  const currentAnimationRef = useRef<string>("idle");
   const clockRef = useRef<THREE.Clock>(new THREE.Clock());
   const controlsRef = useRef<OrbitControls | null>(null);
   const groundOffsetRef = useRef<number>(0);
@@ -108,6 +122,7 @@ const Game: React.FC = () => {
     canJump: true,
     velocity: new THREE.Vector3(),
     direction: new THREE.Vector3(),
+    jumpStartTime: 0,
   });
 
   // Add this new useEffect to handle the DOM-based crosshair
@@ -224,6 +239,7 @@ const Game: React.FC = () => {
           `${window.location.origin}/model_punch_right.gltf`,
           "punch"
         ),
+        loadAnimation(`${window.location.origin}/model_die.gltf`, "die"),
       ]);
 
       return animations;
@@ -299,15 +315,34 @@ const Game: React.FC = () => {
 
           const action = mixer.clipAction(clip);
 
-          // Configure action settings
-          action.clampWhenFinished = false; // Don't clamp for looping animations
-
+          // Configure action settings based on animation type
           if (name === "jump") {
+            // Configure jump animation for physics synchronization
             action.setLoop(THREE.LoopOnce, 1);
             action.repetitions = 1;
-            action.clampWhenFinished = true; // Only clamp the jump animation
+            action.clampWhenFinished = true;
+
+            // Don't set time scale here - we'll calculate it dynamically based on physics
+
+            // Ensure animation starts and ends cleanly
+            action.zeroSlopeAtStart = false; // Start animation immediately
+            action.zeroSlopeAtEnd = true; // Smooth end
+
+            // CRITICAL FIX: Make sure the animation completes properly
+            action.setDuration(clip.duration); // Use original duration
+
+            // Disable automatic crossfade for jump animation
+            action.fadeIn(0);
+            action.fadeOut(0.1); // Very short fade out
+          } else if (name === "punch" || name === "die") {
+            // Configure other one-time animations
+            action.setLoop(THREE.LoopOnce, 1);
+            action.repetitions = 1;
+            action.clampWhenFinished = true;
           } else {
+            // Configure looping animations (idle, walk, run)
             action.setLoop(THREE.LoopRepeat, Infinity);
+            action.clampWhenFinished = false;
           }
 
           // Store the action
@@ -315,10 +350,44 @@ const Game: React.FC = () => {
           console.log(`Animation ${name} added to actions`);
         });
 
+        // Add a mixer event listener to detect when animations finish
+        mixer.addEventListener("finished", (e: any) => {
+          const action = e.action;
+
+          // Check if it's the jump animation that finished
+          if (action === actionsRef.current["jump"]) {
+            console.log("Jump animation finished via mixer event");
+
+            // If we're still in jump animation state, force transition to appropriate animation
+            if (currentAnimationRef.current === "jump") {
+              // Calculate which animation to return to
+              const returnAnimation =
+                movementRef.current.direction.length() > 0
+                  ? movementRef.current.running
+                    ? "run"
+                    : "walk"
+                  : "idle";
+
+              console.log(
+                `Jump animation finished, transitioning to ${returnAnimation}`
+              );
+
+              // Play return animation
+              const returnAction = actionsRef.current[returnAnimation];
+              if (returnAction) {
+                returnAction.reset();
+                returnAction.play();
+                currentAnimationRef.current = returnAnimation;
+              }
+            }
+          }
+        });
+
         // Start with idle animation
         console.log("Starting idle animation");
         if (actionsRef.current["idle"]) {
           actionsRef.current["idle"].play();
+          currentAnimationRef.current = "idle";
         } else {
           console.error("No idle animation found!");
         }
@@ -617,12 +686,49 @@ const Game: React.FC = () => {
         // Only jump if we're on the ground
         if (movementRef.current.canJump) {
           console.log("Jump initiated");
-          movementRef.current.velocity.y = 7; // Jump velocity
+
+          // Apply physics first to calculate jump duration
+          const jumpVelocity = 7; // Jump velocity
+          movementRef.current.velocity.y = jumpVelocity;
           movementRef.current.jumping = true;
           movementRef.current.canJump = false;
 
-          // Schedule jump animation - it's one-time so we don't need to track it
-          setAnimation("jump");
+          // Calculate approximate time in air (using physics formula: t = 2*v0/g)
+          // This is the time to go up and come back down
+          const gravity = 15; // Increased gravity for faster falling
+          const timeInAir = (2 * jumpVelocity) / gravity;
+          console.log(`Estimated time in air: ${timeInAir} seconds`);
+
+          // CRITICAL FIX: Force immediate jump animation with no transitions
+          // This bypasses the normal animation system to eliminate any delay
+          const jumpAction = actionsRef.current["jump"];
+          if (jumpAction && mixerRef.current) {
+            // Store jump start time for tracking
+            movementRef.current.jumpStartTime = performance.now() / 1000;
+
+            // Stop all currently running animations immediately
+            for (const action of Object.values(actionsRef.current)) {
+              action.stop();
+            }
+
+            // Configure and play jump animation directly
+            jumpAction.reset();
+            jumpAction.setLoop(THREE.LoopOnce, 1);
+            jumpAction.clampWhenFinished = true;
+
+            // IMPORTANT: Set the time scale to match the physics
+            // Original animation duration / time in air = time scale factor
+            const originalDuration = jumpAction.getClip().duration;
+            const timeScale = originalDuration / timeInAir;
+
+            // Set time scale to match physics (slower than before)
+            jumpAction.setEffectiveTimeScale(timeScale);
+            jumpAction.setEffectiveWeight(1);
+            jumpAction.play();
+
+            // Update current animation reference
+            currentAnimationRef.current = "jump";
+          }
         }
         break;
       case "ShiftLeft":
@@ -656,6 +762,7 @@ const Game: React.FC = () => {
         break;
       case "Space":
         // Reset jumping state when space is released
+        // Note: We don't reset canJump here - that's handled by physics
         movementRef.current.jumping = false;
         break;
       case "ShiftLeft":
@@ -669,40 +776,146 @@ const Game: React.FC = () => {
 
   // Update character movement and animations
   const updateCharacterMovement = (delta: number) => {
-    if (!modelRef.current || !actionsRef.current || !mixerRef.current) return;
-
-    // Access references
-    const character = modelRef.current;
-    const mixer = mixerRef.current;
+    if (!modelRef.current || !mixerRef.current) return;
 
     // Update animation mixer
-    mixer.update(delta);
+    mixerRef.current.update(delta);
 
-    // Apply gravity
-    movementRef.current.velocity.y -= 9.8 * delta;
+    // Get the control panel configuration
+    const config = getConfig();
 
-    // Update character position based on velocity
-    character.position.y += movementRef.current.velocity.y * delta;
+    // Use the control panel values for movement speeds
+    const walkSpeed = config.player.walkSpeed;
+    const runSpeed = config.player.runSpeed;
 
-    // Floor collision
-    if (character.position.y < groundOffsetRef.current) {
-      character.position.y = groundOffsetRef.current;
-      movementRef.current.velocity.y = 0;
-      movementRef.current.canJump = true;
+    // Get current movement state
+    const {
+      forward,
+      backward,
+      left,
+      right,
+      running,
+      jumping,
+      velocity,
+      direction,
+    } = movementRef.current;
+
+    // Determine if the character is moving
+    const isMoving = forward || backward || left || right;
+    const isRunning = running && isMoving;
+    const isJumping = jumping;
+
+    // Check if state has changed
+    const stateChanged =
+      prevStateRef.current.isMoving !== isMoving ||
+      prevStateRef.current.isRunning !== isRunning ||
+      prevStateRef.current.isJumping !== isJumping;
+
+    // Update previous state
+    prevStateRef.current.isMoving = isMoving;
+    prevStateRef.current.isRunning = isRunning;
+    prevStateRef.current.isJumping = isJumping;
+
+    // Set appropriate animation based on state
+    if (stateChanged) {
+      if (isJumping) {
+        setAnimation("jump");
+      } else if (isMoving) {
+        setAnimation(isRunning ? "run" : "walk");
+      } else {
+        setAnimation("idle");
+      }
     }
 
-    // Reset direction
-    movementRef.current.direction.set(0, 0, 0);
+    // Calculate movement direction
+    direction.set(0, 0, 0);
 
-    // Set direction based on input - standard WASD controls
-    if (movementRef.current.forward) movementRef.current.direction.z -= 1;
-    if (movementRef.current.backward) movementRef.current.direction.z += 1;
-    if (movementRef.current.left) movementRef.current.direction.x -= 1;
-    if (movementRef.current.right) movementRef.current.direction.x += 1;
+    if (forward) direction.z -= 1;
+    if (backward) direction.z += 1;
+    if (left) direction.x -= 1;
+    if (right) direction.x += 1;
 
-    // Normalize direction vector
-    if (movementRef.current.direction.length() > 0) {
-      movementRef.current.direction.normalize();
+    // Normalize direction if moving diagonally
+    if (direction.length() > 1) {
+      direction.normalize();
+    }
+
+    // Calculate movement speed based on running state
+    const movementSpeed = isRunning ? runSpeed : walkSpeed;
+
+    // Apply gravity - increased for faster falling
+    const gravity = 15; // Increased from 9.8
+    velocity.y -= gravity * delta;
+
+    // Update character position based on velocity
+    modelRef.current.position.y += velocity.y * delta;
+
+    // Floor collision - check if we've landed from a jump
+    const wasInAir = modelRef.current.position.y > groundOffsetRef.current;
+
+    if (modelRef.current.position.y < groundOffsetRef.current) {
+      modelRef.current.position.y = groundOffsetRef.current;
+
+      // Only reset jump state if we were falling
+      if (velocity.y < 0) {
+        velocity.y = 0;
+        movementRef.current.canJump = true;
+        movementRef.current.jumping = false;
+
+        // CRITICAL FIX: If we were in a jump animation and have landed, transition to appropriate animation
+        if (isJumping) {
+          // Calculate which animation to return to
+          const returnAnimation =
+            direction.length() > 0 ? (running ? "run" : "walk") : "idle";
+          setAnimation(returnAnimation);
+        }
+      }
+    }
+    // Check if we're at the peak of the jump (velocity close to 0)
+    else if (isJumping && Math.abs(velocity.y) < 0.5) {
+      // We're at the peak of the jump - make sure animation is at the midpoint
+      const jumpAction = actionsRef.current["jump"];
+      if (jumpAction) {
+        // Get the clip duration
+        const clipDuration = jumpAction.getClip().duration;
+
+        // If animation hasn't reached midpoint yet, adjust it
+        if (jumpAction.time < clipDuration / 2) {
+          // Set time to midpoint
+          jumpAction.time = clipDuration / 2;
+        }
+      }
+    }
+
+    // CRITICAL FIX: Check for stuck jump animation
+    // If we're in jump animation but on the ground and not jumping, force transition to appropriate animation
+    if (
+      isJumping &&
+      modelRef.current.position.y <= groundOffsetRef.current &&
+      !jumping
+    ) {
+      // Calculate which animation to return to
+      const returnAnimation =
+        direction.length() > 0 ? (running ? "run" : "walk") : "idle";
+
+      console.log(
+        `Fixing stuck jump animation, transitioning to ${returnAnimation}`
+      );
+
+      // Play return animation
+      const returnAction = actionsRef.current[returnAnimation];
+      if (returnAction) {
+        // Stop jump animation
+        const jumpAction = actionsRef.current["jump"];
+        if (jumpAction) {
+          jumpAction.stop();
+        }
+
+        // Play return animation immediately
+        returnAction.reset();
+        returnAction.play();
+        currentAnimationRef.current = returnAnimation;
+      }
     }
 
     // Apply camera rotation to direction
@@ -712,73 +925,42 @@ const Game: React.FC = () => {
         cameraRef.current.rotation.y,
         0
       );
-      movementRef.current.direction.applyEuler(cameraRotation);
+      direction.applyEuler(cameraRotation);
     }
 
-    // Calculate if we're moving
-    const { direction, running, jumping } = movementRef.current;
-    const speed = direction.length();
-    const isMoving = speed > 0.1;
-    const isRunning = isMoving && running;
-    const isJumping = jumping;
+    // Handle player rotation
+    if (modelRef.current && cameraRef.current) {
+      if (isMoving && direction.length() > 0) {
+        // When moving, face the direction of movement
+        // Calculate the target rotation based on movement direction
+        const targetRotation = Math.atan2(direction.x, direction.z);
 
-    // Initialize previous state if not already done
-    if (!prevStateRef.current) {
-      prevStateRef.current = { isMoving, isRunning, isJumping };
-    }
-
-    // Determine which animation should be playing based on priority
-    let targetAnimation = "idle"; // Default animation
-
-    if (isJumping) {
-      targetAnimation = "jump";
-    } else if (isMoving) {
-      targetAnimation = isRunning ? "run" : "walk";
-    }
-
-    // Only update animation if there is a state change or jump is triggered
-    // Jump has highest priority and should always interrupt other animations
-    const prev = prevStateRef.current;
-    if (
-      targetAnimation === "jump" || // Jump always triggers immediately
-      prev.isMoving !== isMoving ||
-      (isMoving && prev.isRunning !== isRunning) || // Only check running state if we're moving
-      prev.isJumping !== isJumping
-    ) {
-      // Update the animation
-      setAnimation(targetAnimation);
-
-      // Update previous state right away to avoid animation flicker
-      prevStateRef.current = { isMoving, isRunning, isJumping };
-    }
-
-    // Get the cursor direction for character facing when stationary
-    if (cameraRef.current) {
-      const cursorDirection = new THREE.Vector3(0, 0, -1);
-      cursorDirection.applyQuaternion(cameraRef.current.quaternion);
-      cursorDirection.y = 0;
-      cursorDirection.normalize();
-
-      // If moving, face the direction of movement. Otherwise, face the cursor
-      if (isMoving) {
-        const targetRotation = Math.atan2(
-          movementRef.current.direction.x,
-          movementRef.current.direction.z
-        );
-        character.rotation.y = targetRotation;
+        // Apply rotation directly for responsive control
+        modelRef.current.rotation.y = targetRotation;
       } else {
-        const cursorRotation = Math.atan2(cursorDirection.x, cursorDirection.z);
-        character.rotation.y = cursorRotation;
+        // When not moving, face the direction of the camera
+        // Get the camera's forward direction in world space
+        const forward = new THREE.Vector3(0, 0, -1);
+        forward.applyQuaternion(cameraRef.current.quaternion);
+
+        // Project onto the horizontal plane
+        forward.y = 0;
+        forward.normalize();
+
+        // Calculate rotation from the forward vector
+        const targetRotation = Math.atan2(forward.x, forward.z);
+
+        // Apply rotation directly
+        modelRef.current.rotation.y = targetRotation;
       }
     }
 
     // Move character based on direction
-    const moveSpeed = running ? RUN_SPEED : WALK_SPEED;
-    character.position.x += direction.x * moveSpeed * delta;
-    character.position.z += direction.z * moveSpeed * delta;
+    modelRef.current.position.x += direction.x * movementSpeed * delta;
+    modelRef.current.position.z += direction.z * movementSpeed * delta;
 
     // Check for platform collisions
-    checkPlatformCollisions(character.position);
+    checkPlatformCollisions(modelRef.current.position);
 
     // Check for all other collisions and resolve them
     resolveCollisions();
@@ -791,12 +973,16 @@ const Game: React.FC = () => {
   const updateCamera = () => {
     if (!modelRef.current || !cameraRef.current) return;
 
+    // Get camera configuration from control panel
+    const config = getConfig();
+
     // Set camera target to character position
     const targetPosition = modelRef.current.position.clone();
 
     // Calculate camera position based on character position and mouse
-    const cameraDistance = 5; // Distance from character
-    const cameraHeight = 2; // Height offset
+    const cameraDistance = config.camera.distance; // Distance from character
+    const cameraHeight = config.camera.height; // Height offset
+    const cameraSmoothing = config.camera.smoothing; // Smoothing factor
 
     // Use mouse X position to determine camera angle around character
     const cameraRotationY = -mouseRef.current.x * Math.PI;
@@ -805,17 +991,25 @@ const Game: React.FC = () => {
     const verticalAngle =
       Math.max(-0.5, Math.min(0.5, -mouseRef.current.y)) * 0.5;
 
-    // Set camera position using spherical coordinates
-    cameraRef.current.position.x =
+    // Calculate ideal camera position using spherical coordinates
+    const idealX =
       targetPosition.x +
       Math.sin(cameraRotationY) * cameraDistance * Math.cos(verticalAngle);
-    cameraRef.current.position.z =
+    const idealZ =
       targetPosition.z +
       Math.cos(cameraRotationY) * cameraDistance * Math.cos(verticalAngle);
-    cameraRef.current.position.y =
+    const idealY =
       targetPosition.y +
       cameraHeight +
       Math.sin(verticalAngle) * cameraDistance;
+
+    // Apply smoothing to camera movement
+    cameraRef.current.position.x +=
+      (idealX - cameraRef.current.position.x) * cameraSmoothing;
+    cameraRef.current.position.y +=
+      (idealY - cameraRef.current.position.y) * cameraSmoothing;
+    cameraRef.current.position.z +=
+      (idealZ - cameraRef.current.position.z) * cameraSmoothing;
 
     // Look at character
     cameraRef.current.lookAt(targetPosition);
@@ -831,6 +1025,9 @@ const Game: React.FC = () => {
       console.error(`Animation ${name} not found or mixer not initialized!`);
       return;
     }
+
+    // Store the current animation name for reference
+    currentAnimationRef.current = name;
 
     // Get the requested action
     const nextAction = actions[name];
@@ -853,8 +1050,13 @@ const Game: React.FC = () => {
     }
 
     // If already playing the requested animation, don't interrupt
-    // (except for jump which should always play)
-    if (currentAction === nextAction && name !== "jump" && name !== "punch") {
+    // (except for jump, punch, and die which should always play)
+    if (
+      currentAction === nextAction &&
+      name !== "jump" &&
+      name !== "punch" &&
+      name !== "die"
+    ) {
       return;
     }
 
@@ -866,52 +1068,93 @@ const Game: React.FC = () => {
     nextAction.reset();
     nextAction.enabled = true;
     nextAction.setEffectiveTimeScale(1); // Set all animations to default speed
-    nextAction.setEffectiveWeight(1);
+
+    // Special handling for one-time animations
+    if (name === "jump" || name === "punch" || name === "die") {
+      nextAction.setLoop(THREE.LoopOnce, 1);
+      nextAction.clampWhenFinished = true;
+      nextAction.setEffectiveWeight(1);
+    } else {
+      nextAction.setLoop(THREE.LoopRepeat, Infinity);
+      nextAction.clampWhenFinished = false;
+      nextAction.setEffectiveWeight(1);
+    }
 
     // Handle transition from current animation if it exists
     if (currentAction) {
-      // Quick transitions for jump and punch
-      const duration = name === "jump" || name === "punch" ? 0.1 : 0.3;
+      // Determine appropriate transition duration based on animation types
+      let transitionDuration = 0.3; // Default transition duration
 
+      // Quick transitions for jump, punch, and die
+      if (name === "jump" || name === "punch" || name === "die") {
+        transitionDuration = 0.1;
+      }
       // Smoother transitions between walk and run
-      const smoothTransition =
+      else if (
         (currentAnimName === "walk" && name === "run") ||
-        (currentAnimName === "run" && name === "walk");
+        (currentAnimName === "run" && name === "walk")
+      ) {
+        transitionDuration = 0.5;
+      }
+      // Faster transition to idle
+      else if (name === "idle") {
+        transitionDuration = 0.2;
+      }
 
-      nextAction.crossFadeFrom(
-        currentAction,
-        smoothTransition ? 0.5 : duration,
-        true
-      );
+      // Apply crossfade
+      nextAction.crossFadeFrom(currentAction, transitionDuration, true);
     }
 
+    // Play the animation
     nextAction.play();
 
-    // Special handling for one-time animations
-    if (name === "jump" || name === "punch") {
-      // Configure as non-looping animation
-      nextAction.setLoop(THREE.LoopOnce, 1);
-      nextAction.clampWhenFinished = true;
-
-      // Create a one-time event listener for completion
+    // For one-time animations, set up a callback to return to previous state
+    if ((name === "jump" || name === "punch") && mixer) {
       const onFinished = (e: THREE.Event) => {
-        // Clean up the event listener
+        // Only handle the event if it's from our action
+        if ((e as any).action !== nextAction) return;
+
+        // Remove the listener
         mixer.removeEventListener("finished", onFinished);
 
-        // Return to appropriate animation based on movement state
-        if (movementRef.current.direction.length() >= 0.1) {
-          const nextAnim = movementRef.current.running ? "run" : "walk";
-          console.log(`${name} finished, transitioning to ${nextAnim}`);
-          setAnimation(nextAnim);
-        } else {
-          console.log(`${name} finished, returning to idle`);
-          setAnimation("idle");
+        // Determine which animation to return to
+        let returnAnimation = "idle";
+
+        // If we're moving, return to the appropriate movement animation
+        if (movementRef.current.direction.length() > 0) {
+          returnAnimation = movementRef.current.running ? "run" : "walk";
+        }
+
+        console.log(
+          `${name} animation finished, returning to ${returnAnimation}`
+        );
+
+        // Don't call setAnimation directly to avoid recursion issues
+        // Instead, play the return animation directly
+        const returnAction = actions[returnAnimation];
+        if (returnAction) {
+          returnAction.reset();
+          returnAction.enabled = true;
+          returnAction.setEffectiveTimeScale(1);
+          returnAction.setEffectiveWeight(1);
+          returnAction.setLoop(THREE.LoopRepeat, Infinity);
+          returnAction.crossFadeFrom(nextAction, 0.2, true);
+          returnAction.play();
+
+          // Update the current animation reference
+          currentAnimationRef.current = returnAnimation;
         }
       };
 
-      // Use the mixer's event system
       mixer.addEventListener("finished", onFinished);
     }
+
+    // Get animation configuration from control panel
+    const config = getConfig();
+    const transitionSpeed = config.animation.transitionSpeed;
+
+    // Use transition speed in animation blending if applicable
+    // ... rest of the function ...
   };
 
   // Improve collision detection and handling
@@ -1106,19 +1349,132 @@ const Game: React.FC = () => {
 
     switch (data.type) {
       case "init":
-        // Store the player's ID
-        playerIdRef.current = data.data.id;
-        console.log("Received player ID:", playerIdRef.current);
+        console.log("Received init message:", data);
+        const newPlayerId = data.data.id;
+        console.log(`Server assigned player ID: ${newPlayerId}`);
+        console.log(`Current playerIdRef: ${playerIdRef.current}`);
+        console.log(`Current playerName: "${playerName}"`);
 
-        // Create materials with the assigned color
-        setPlayerColor(new THREE.Color(data.data.color));
+        // IMPORTANT: Store the player ID in local storage to persist across refreshes
+        try {
+          localStorage.setItem("playerIdRef", newPlayerId.toString());
+          console.log(`Stored player ID ${newPlayerId} in local storage`);
+        } catch (e) {
+          console.warn("Could not store player ID in local storage:", e);
+        }
 
-        // Initialize local player's health bar
-        updateLocalPlayerHealthBar(MAX_PLAYER_HEALTH);
+        // Set the player ID
+        playerIdRef.current = newPlayerId;
+        console.log(`Updated playerIdRef to: ${playerIdRef.current}`);
 
-        // Add existing players
+        // Initialize the local player with a default name
+        const localPlayerData = data.data.players.find(
+          (p: any) => p.id === newPlayerId
+        );
+
+        if (localPlayerData) {
+          console.log("Found local player data:", localPlayerData);
+
+          // Check if the server sent a name for this player
+          if (localPlayerData.name) {
+            console.log(`Server provided name: "${localPlayerData.name}"`);
+          } else {
+            console.log("Server did not provide a name for this player");
+          }
+
+          // Determine what name to use - prioritize the name entered by the player
+          const nameToUse =
+            playerName || localPlayerData.name || `Player ${newPlayerId}`;
+          console.log(`Using name: "${nameToUse}" for local player`);
+
+          const localPlayer: Player = {
+            id: newPlayerId,
+            color: localPlayerData.color,
+            position: new THREE.Vector3(
+              localPlayerData.position.x,
+              localPlayerData.position.y,
+              localPlayerData.position.z
+            ),
+            rotation: localPlayerData.rotation,
+            animation: localPlayerData.animation,
+            health: localPlayerData.health || MAX_PLAYER_HEALTH,
+            maxHealth: localPlayerData.maxHealth || MAX_PLAYER_HEALTH,
+            kills: localPlayerData.kills || 0,
+            deaths: localPlayerData.deaths || 0,
+            name: nameToUse, // Use the determined name
+          };
+
+          console.log(`Creating local player with name: "${localPlayer.name}"`);
+          playersRef.current.set(newPlayerId, localPlayer);
+
+          // Log all players after adding the local player
+          console.log(
+            "Players after adding local player:",
+            Array.from(playersRef.current.keys())
+          );
+
+          // Force update the player name in the map
+          if (playerName) {
+            console.log(`Forcing player name to "${playerName}" in the map`);
+            const mapPlayer = playersRef.current.get(newPlayerId);
+            if (mapPlayer) {
+              mapPlayer.name = playerName;
+            }
+          }
+
+          // If we already have a player name set but haven't sent it to the server yet,
+          // send it now
+          if (
+            playerName &&
+            socketRef.current &&
+            socketRef.current.readyState === WebSocket.OPEN
+          ) {
+            console.log(`Sending player name "${playerName}" to server`);
+            socketRef.current.send(
+              JSON.stringify({
+                type: "updateName",
+                data: {
+                  id: newPlayerId,
+                  name: playerName,
+                },
+              })
+            );
+          }
+
+          // Force create the health bar with the correct name
+          setTimeout(() => {
+            const player = playersRef.current.get(newPlayerId);
+            if (player && player.model) {
+              console.log(
+                `Creating health bar for local player with name: "${player.name}"`
+              );
+              createPlayerHealthBar(player);
+            } else {
+              console.log(
+                `Cannot create health bar yet - player model not ready`
+              );
+
+              // Try again in a bit
+              setTimeout(() => {
+                const player = playersRef.current.get(newPlayerId);
+                if (player && player.model) {
+                  console.log(
+                    `Second attempt: Creating health bar for local player with name: "${player.name}"`
+                  );
+                  createPlayerHealthBar(player);
+                }
+              }, 2000);
+            }
+          }, 1000); // Wait a second for the model to load
+        } else {
+          console.warn(`Local player data not found for ID: ${newPlayerId}`);
+        }
+
+        // Add other players
         data.data.players.forEach((player: any) => {
-          console.log("Creating player from init:", player.id);
+          if (player.id === newPlayerId || playersRef.current.has(player.id))
+            return;
+
           const newPlayer: Player = {
             id: player.id,
             color: player.color,
@@ -1128,21 +1484,131 @@ const Game: React.FC = () => {
               player.position.z
             ),
             rotation: player.rotation,
-            animation: player.animation || "idle",
+            animation: player.animation,
             health: player.health || MAX_PLAYER_HEALTH,
             maxHealth: player.maxHealth || MAX_PLAYER_HEALTH,
+            kills: player.kills || 0,
+            deaths: player.deaths || 0,
+            name: player.name || `Player ${player.id}`, // Ensure name has a default
           };
           playersRef.current.set(player.id, newPlayer);
           createOtherPlayer(newPlayer);
         });
         break;
 
+      case "nameUpdate":
+        console.log("Name update received:", data);
+        const updatedPlayerId = data.data.id;
+        const updatedPlayerName = data.data.name;
+
+        console.log(
+          `Server updating player ${updatedPlayerId} name to "${updatedPlayerName}"`
+        );
+
+        // Check if this is for the local player
+        if (updatedPlayerId === playerIdRef.current) {
+          console.log(`This is a name update for the local player`);
+
+          // Update the player object directly
+          const localPlayer = playersRef.current.get(updatedPlayerId);
+          if (localPlayer) {
+            console.log(
+              `Updating local player name from "${localPlayer.name}" to "${updatedPlayerName}"`
+            );
+            localPlayer.name = updatedPlayerName;
+
+            // Update the health bar if it exists
+            if (localPlayer.healthBar) {
+              console.log(`Updating health bar with new name`);
+              updatePlayerHealthBar(localPlayer);
+            } else {
+              console.log(`No health bar found, will update when created`);
+            }
+
+            // Update player stats if scoreboard is visible
+            if (showScoreboard) {
+              updatePlayerStats();
+            }
+          } else {
+            console.warn(
+              `Cannot update name: Local player ${updatedPlayerId} not found in playersRef`
+            );
+            console.log(
+              "Current players:",
+              Array.from(playersRef.current.keys())
+            );
+          }
+        } else {
+          // This is for another player
+          console.log(`This is a name update for another player`);
+
+          // Update the player object
+          const otherPlayer = playersRef.current.get(updatedPlayerId);
+          if (otherPlayer) {
+            console.log(
+              `Updating other player name from "${otherPlayer.name}" to "${updatedPlayerName}"`
+            );
+            otherPlayer.name = updatedPlayerName;
+
+            // Update the health bar if it exists
+            if (otherPlayer.healthBar) {
+              updatePlayerHealthBar(otherPlayer);
+            }
+
+            // Update player stats if scoreboard is visible
+            if (showScoreboard) {
+              updatePlayerStats();
+            }
+          } else {
+            console.warn(
+              `Cannot update name: Other player ${updatedPlayerId} not found in playersRef`
+            );
+          }
+        }
+        break;
+
       case "playerJoined":
         console.log("Player joined:", data.data.id);
-        if (data.data.id !== playerIdRef.current) {
+
+        if (
+          playersRef.current.has(data.data.id) ||
+          data.data.id === playerIdRef.current
+        ) {
+          break;
+        }
+
+        const newPlayer: Player = {
+          id: data.data.id,
+          color: data.data.color,
+          position: new THREE.Vector3(
+            data.data.position.x,
+            data.data.position.y,
+            data.data.position.z
+          ),
+          rotation: data.data.rotation,
+          animation: data.data.animation,
+          health: data.data.health || MAX_PLAYER_HEALTH,
+          maxHealth: data.data.maxHealth || MAX_PLAYER_HEALTH,
+          kills: data.data.kills || 0,
+          deaths: data.data.deaths || 0,
+          name: data.data.name || `Player ${data.data.id}`, // Ensure name has a default
+        };
+        playersRef.current.set(data.data.id, newPlayer);
+        createOtherPlayer(newPlayer);
+        break;
+
+      case "playerUpdate":
+        // Check if this message is about a player that doesn't exist in our map yet
+        if (!playersRef.current.has(data.data.id)) {
+          console.log(
+            `Received update for unknown player ${data.data.id} - creating new player`
+          );
+          console.log("Player update data:", data.data);
+
+          // Create a new player object
           const newPlayer: Player = {
             id: data.data.id,
-            color: data.data.color,
+            color: data.data.color || 0xff0000, // Default red
             position: new THREE.Vector3(
               data.data.position.x,
               data.data.position.y,
@@ -1152,16 +1618,45 @@ const Game: React.FC = () => {
             animation: data.data.animation || "idle",
             health: data.data.health || MAX_PLAYER_HEALTH,
             maxHealth: data.data.maxHealth || MAX_PLAYER_HEALTH,
+            kills: data.data.kills || 0,
+            deaths: data.data.deaths || 0,
+            name: data.data.name || `Player ${data.data.id}`,
           };
-          playersRef.current.set(data.data.id, newPlayer);
-          createOtherPlayer(newPlayer);
-        }
-        break;
 
-      case "playerUpdate":
-        // Ignore updates for the current player
-        if (data.data.id !== playerIdRef.current) {
-          console.log(`Received update for player ${data.data.id}:`, data.data);
+          // Add to the map
+          playersRef.current.set(data.data.id, newPlayer);
+          console.log(
+            `Added new player ${data.data.id} to players map, name: ${newPlayer.name}`
+          );
+          console.log(
+            "Current players:",
+            Array.from(playersRef.current.keys())
+          );
+
+          // Create the player model
+          createOtherPlayer(newPlayer);
+        } else {
+          // Normal update for existing player
+          console.log(`Updating existing player ${data.data.id}`);
+          console.log("Update data:", {
+            position: data.data.position
+              ? `(${data.data.position.x.toFixed(
+                  2
+                )}, ${data.data.position.y.toFixed(
+                  2
+                )}, ${data.data.position.z.toFixed(2)})`
+              : "not provided",
+            rotation:
+              data.data.rotation !== undefined
+                ? data.data.rotation.toFixed(2)
+                : "not provided",
+            animation: data.data.animation || "not provided",
+            health:
+              data.data.health !== undefined
+                ? data.data.health
+                : "not provided",
+            name: data.data.name || "not provided",
+          });
           updateOtherPlayer(data.data);
         }
         break;
@@ -1188,24 +1683,62 @@ const Game: React.FC = () => {
         const fireball = new THREE.Mesh(geometry, material);
 
         // Set position from data
-        fireball.position.set(
+        const startPosition = new THREE.Vector3(
           data.data.position.x,
           data.data.position.y,
           data.data.position.z
         );
+        fireball.position.copy(startPosition);
 
-        // Set direction from data
-        const direction = new THREE.Vector3(
-          data.data.direction.x,
-          data.data.direction.y,
-          data.data.direction.z
-        ).normalize();
+        // Store target point if available
+        let targetPoint;
+        let direction: THREE.Vector3;
+        if (data.data.targetPoint) {
+          targetPoint = new THREE.Vector3(
+            data.data.targetPoint.x,
+            data.data.targetPoint.y,
+            data.data.targetPoint.z
+          );
+          fireball.userData.targetPoint = targetPoint;
 
-        // Store metadata
+          // Create a brief visual marker at the target point
+          const targetMarker = new THREE.Mesh(
+            new THREE.SphereGeometry(0.1, 8, 8),
+            new THREE.MeshBasicMaterial({
+              color: 0xff0000,
+              transparent: true,
+              opacity: 0.5,
+            })
+          );
+          targetMarker.position.copy(targetPoint);
+          sceneRef.current.add(targetMarker);
+          setTimeout(() => {
+            sceneRef.current?.remove(targetMarker);
+          }, 500);
+
+          // Calculate direction from start to target for perfect aiming
+          direction = new THREE.Vector3()
+            .subVectors(targetPoint, startPosition)
+            .normalize();
+
+          // Store metadata for trajectory calculation
+          fireball.userData.startPosition = startPosition.clone();
+          fireball.userData.distanceToTarget =
+            startPosition.distanceTo(targetPoint);
+        } else {
+          // Fallback to using the provided direction if no target point
+          direction = new THREE.Vector3(
+            data.data.direction.x,
+            data.data.direction.y,
+            data.data.direction.z
+          ).normalize();
+        }
+
+        // Store direction in userData
         fireball.userData.direction = direction;
         fireball.userData.createdTime = performance.now() / 1000;
         fireball.userData.ownerId = data.data.playerId;
-        fireball.userData.speed = 25; // Same speed as local fireballs
+        fireball.userData.speed = 30; // Same speed as local fireballs
 
         // Add to scene and tracking array
         sceneRef.current.add(fireball);
@@ -1214,6 +1747,111 @@ const Game: React.FC = () => {
         // Add point light for glow effect
         const light = new THREE.PointLight(0xff5500, 1, 2);
         fireball.add(light);
+
+        // Create burst effect at the starting position
+        createBurstEffect(fireball.position.clone(), direction);
+        break;
+
+      case "playerKill":
+        console.log(
+          `Player ${data.data.killerId} killed player ${data.data.victimId}`
+        );
+
+        // Update killer stats
+        const killerPlayer = playersRef.current.get(data.data.killerId);
+        if (killerPlayer) {
+          killerPlayer.kills = data.data.killerKills || 0;
+          console.log(
+            `Updated killer (${data.data.killerId}) kills to ${killerPlayer.kills}`
+          );
+        }
+
+        // Update victim stats
+        const victimPlayer = playersRef.current.get(data.data.victimId);
+        if (victimPlayer) {
+          victimPlayer.deaths = data.data.victimDeaths || 0;
+          console.log(
+            `Updated victim (${data.data.victimId}) deaths to ${victimPlayer.deaths}`
+          );
+        }
+
+        // Update player stats for scoreboard
+        if (playersRef.current) {
+          // Create a new array with the updated stats
+          const updatedStats = Array.from(playersRef.current.values()).map(
+            (player) => ({
+              id: player.id,
+              kills: player.kills || 0,
+              deaths: player.deaths || 0,
+              name: player.name || `Player ${player.id}`,
+            })
+          );
+
+          // Sort by kills (highest first)
+          updatedStats.sort((a, b) => b.kills - a.kills);
+
+          // Force update by creating a new array
+          setPlayerStats([...updatedStats]);
+
+          // Log the updated stats for debugging
+          console.log("Updated player stats after kill:", updatedStats);
+        }
+        break;
+
+      case "kill":
+        // ... existing code ...
+        // Update player stats for scoreboard if visible
+        if (showScoreboard && playersRef.current) {
+          // Create a new array with the updated stats
+          const killStats = Array.from(playersRef.current.values()).map(
+            (player) => ({
+              id: player.id,
+              kills: player.kills || 0,
+              deaths: player.deaths || 0,
+              name: player.name || `Player ${player.id}`,
+            })
+          );
+
+          // Sort by kills (highest first)
+          killStats.sort((a, b) => b.kills - a.kills);
+
+          // Force update by creating a new array
+          setPlayerStats([...killStats]);
+
+          // Log the updated stats for debugging
+          console.log("Updated player stats after kill:", killStats);
+        }
+        break;
+
+      case "playerStats":
+        // Update player stats with name property
+        const playerStatsData = data.data.map((player: any) => ({
+          id: player.id,
+          kills: player.kills || 0,
+          deaths: player.deaths || 0,
+          name: player.name || `Player ${player.id}`,
+        }));
+        setPlayerStats(playerStatsData);
+        break;
+
+      case "playerList":
+        // Update player list
+        const playerList = data.data;
+        console.log("Received player list:", playerList);
+
+        // Create a new array with the updated stats
+        const playerListStats = playerList.map((player: any) => ({
+          id: player.id,
+          kills: player.kills || 0,
+          deaths: player.deaths || 0,
+          name: player.name || `Player ${player.id}`,
+        }));
+
+        // Sort by kills (highest first)
+        playerListStats.sort((a: any, b: any) => b.kills - a.kills);
+
+        // Force update by creating a new array
+        setPlayerStats([...playerListStats]);
         break;
 
       default:
@@ -1223,87 +1861,208 @@ const Game: React.FC = () => {
 
   // Function to update an other player's position and animation
   const updateOtherPlayer = (data: any) => {
+    console.log("Updating other player:", data);
+
+    // Check if this is the local player - if so, don't update
+    if (data.id === playerIdRef.current) {
+      console.log("Ignoring update for local player");
+      return;
+    }
+
+    // Debug: Check if player exists
+    if (!playersRef.current.has(data.id)) {
+      console.warn(
+        `Cannot update player ${data.id} - not found in players map`
+      );
+      console.log("Current players:", Array.from(playersRef.current.keys()));
+
+      // Create the player if it doesn't exist
+      console.log("Creating new player for ID:", data.id);
+      const newPlayer: Player = {
+        id: data.id,
+        color: data.color || 0xff0000, // Default red color
+        position: new THREE.Vector3(
+          data.position.x,
+          data.position.y,
+          data.position.z
+        ),
+        rotation: data.rotation,
+        animation: data.animation,
+        health: data.health || MAX_PLAYER_HEALTH,
+        maxHealth: data.maxHealth || MAX_PLAYER_HEALTH,
+        kills: data.kills || 0,
+        deaths: data.deaths || 0,
+        name: data.name || `Player ${data.id}`, // Use the name from the update if available
+      };
+
+      playersRef.current.set(data.id, newPlayer);
+      createOtherPlayer(newPlayer);
+      return;
+    }
+
+    // Update the player
     const player = playersRef.current.get(data.id);
     if (!player) return;
 
-    // Update stored data
-    player.position.set(data.position.x, data.position.y, data.position.z);
-    player.rotation = data.rotation;
-    player.animation = data.animation;
+    // Update position, rotation, animation
+    if (data.position) {
+      if (player.model) {
+        // Smoothly move toward the target position
+        const targetPosition = new THREE.Vector3(
+          data.position.x,
+          data.position.y,
+          data.position.z
+        );
 
-    // Check if health has changed
-    const healthChanged =
-      data.health !== undefined && player.health !== data.health;
-    if (healthChanged) {
+        // Simple lerp for smoother updates
+        const lerpFactor = 0.3; // Adjust this for smoother or faster updates
+        player.model.position.lerp(targetPosition, lerpFactor);
+
+        // Also update the player's stored position
+        player.position = new THREE.Vector3(
+          data.position.x,
+          data.position.y,
+          data.position.z
+        );
+      } else {
+        // If no model yet, just update the stored position
+        player.position = new THREE.Vector3(
+          data.position.x,
+          data.position.y,
+          data.position.z
+        );
+      }
+    }
+
+    if (data.rotation !== undefined && player.model) {
+      player.rotation = data.rotation;
+      player.model.rotation.y = data.rotation;
+    }
+
+    // Update health if provided
+    if (data.health !== undefined) {
+      // Store old health for reference
+      const oldHealth = player.health;
+
+      // Log every health update attempt, even if the health hasn't changed
       console.log(
-        `Player ${data.id} health updated: ${player.health} -> ${data.health}`
+        `Health update for player ${data.id}: Server=${
+          data.health
+        }, Client=${oldHealth}, Changed=${oldHealth !== data.health}`
       );
+
+      // IMPORTANT: Server is the source of truth for health
       player.health = data.health;
 
-      // Update health bar if it exists
+      // Always update the health bar display to ensure it reflects the current health
       if (player.healthBar) {
-        updatePlayerHealthBar(player);
+        console.log(
+          `Updating health bar for player ${data.id} to ${data.health}/${player.maxHealth}`
+        );
+
+        // Force immediate update of health bar without animations to ensure it's correct
+        if (player.healthBarForeground) {
+          // Update the width directly based on current health
+          const healthRatio = Math.max(0, player.health / player.maxHealth);
+          player.healthBarForeground.style.width = `${healthRatio * 100}%`;
+
+          // Change color based on health level
+          if (healthRatio < 0.3) {
+            player.healthBarForeground.style.backgroundColor = "#ff0000"; // Red when low health
+          } else if (healthRatio < 0.6) {
+            player.healthBarForeground.style.backgroundColor = "#ffaa00"; // Orange when medium health
+          } else {
+            player.healthBarForeground.style.backgroundColor = "#00ff00"; // Green when high health
+          }
+        }
+      } else {
+        console.warn(`Player ${data.id} has no health bar to update!`);
+        // Try to create the health bar if it doesn't exist
+        createPlayerHealthBar(player);
       }
 
       // If health is zero, handle defeat
-      if (player.health <= 0) {
+      if (data.health <= 0 && oldHealth > 0) {
         console.log(`Player ${data.id} health is zero, handling defeat`);
         handlePlayerDefeat(player);
       }
     }
 
-    // Update model position and rotation if it exists
-    if (player.model) {
-      player.model.position.copy(player.position);
-      player.model.rotation.y = player.rotation;
+    // Update kills if it changed
+    if (data.kills !== undefined && data.kills !== player.kills) {
+      player.kills = data.kills;
+      console.log(
+        `Player ${data.id} kills updated: ${player.kills} -> ${data.kills}`
+      );
     }
 
-    // Update animation if needed
-    if (player.mixer && player.actions && player.animation) {
-      const currentAnimation = player.animation;
+    // Update deaths if it changed
+    if (data.deaths !== undefined && data.deaths !== player.deaths) {
+      player.deaths = data.deaths;
+      console.log(
+        `Player ${data.id} deaths updated: ${player.deaths} -> ${data.deaths}`
+      );
+    }
 
-      // Find currently playing animation
-      let currentlyPlaying = null;
-      Object.entries(player.actions).forEach(([name, action]) => {
-        if (action.isRunning() && action.getEffectiveWeight() > 0) {
-          currentlyPlaying = name;
-        }
-      });
+    // Update name if it's provided and different
+    if (data.name && data.name !== player.name) {
+      console.log(
+        `Player ${data.id} name updated: "${player.name}" -> "${data.name}"`
+      );
+      player.name = data.name;
 
-      // Only change animation if it's different from what's currently playing
-      if (currentlyPlaying !== currentAnimation) {
-        console.log(
-          `Changing player ${player.id} animation to ${currentAnimation}`
-        );
+      // Update the health bar to show the new name
+      if (player.healthBar) {
+        updatePlayerHealthBar(player);
+      }
+    }
 
-        // Stop all animations
+    // Update animation if it changed
+    if (data.animation && data.animation !== player.animation) {
+      // Don't change animation if player is in a jump
+      if (
+        player.animation === "jump" &&
+        player.jumpStartTime &&
+        performance.now() - player.jumpStartTime < 1000
+      ) {
+        console.log("Not interrupting jump animation");
+        return;
+      }
+
+      // Update the animation
+      player.animation = data.animation;
+
+      // Set animation on the player model
+      if (player.mixer && player.actions && player.actions[data.animation]) {
+        console.log(`Setting ${player.id}'s animation to ${data.animation}`);
+        // Stop all current animations
         Object.values(player.actions).forEach((action) => {
           action.stop();
         });
-
-        // Start new animation
-        const newAction = player.actions[currentAnimation];
-        if (newAction) {
-          if (currentAnimation === "jump") {
-            newAction.setLoop(THREE.LoopOnce, 1);
-            newAction.clampWhenFinished = true;
-
-            // Set up transition back to idle after jump
-            newAction.reset().play();
-            const mixer = player.mixer;
-            const onFinished = (e: any) => {
-              mixer.removeEventListener("finished", onFinished);
-              const idleAction = player.actions?.["idle"];
-              if (idleAction) {
-                idleAction.reset().play();
-              }
-            };
-            mixer.addEventListener("finished", onFinished);
-          } else {
-            newAction.reset().play();
-          }
-        }
+        // Play the new animation
+        player.actions[data.animation].reset().play();
+      } else {
+        console.log(
+          `Can't set animation ${data.animation} for player ${player.id} - not available`
+        );
       }
+    }
+
+    // Update player stats if scoreboard is visible
+    if (showScoreboard && playersRef.current) {
+      // Create a new array with the updated stats
+      const updatedStats = Array.from(playersRef.current.values()).map((p) => ({
+        id: p.id,
+        kills: p.kills || 0,
+        deaths: p.deaths || 0,
+        name: p.name || `Player ${p.id}`,
+      }));
+
+      // Sort by kills (highest first)
+      updatedStats.sort((a, b) => b.kills - a.kills);
+
+      // Force update by creating a new array
+      setPlayerStats([...updatedStats]);
     }
   };
 
@@ -1318,71 +2077,103 @@ const Game: React.FC = () => {
 
   // Function to send position updates to the server
   const sendPositionUpdate = () => {
-    if (
-      !socketRef.current ||
-      socketRef.current.readyState !== WebSocket.OPEN ||
-      !modelRef.current
-    ) {
+    if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    if (!modelRef.current || playerIdRef.current === null) {
       return;
     }
 
     const position = modelRef.current.position;
     const rotation = modelRef.current.rotation.y;
+    const animation = currentAnimationRef.current;
 
-    // Determine current animation
-    let animation = "idle";
-    const actions = actionsRef.current;
+    // Get the local player's info from the map for additional data
+    const localPlayer = playersRef.current.get(playerIdRef.current);
 
-    for (const [name, action] of Object.entries(actions)) {
-      if (
-        action.isRunning() &&
-        !action.paused &&
-        action.getEffectiveWeight() > 0.1
-      ) {
-        animation = name;
-        break;
-      }
-    }
-
-    // Fallback to movement-based animation determination
-    if (animation === "idle") {
-      if (movementRef.current.jumping) {
-        animation = "jump";
-      } else if (movementRef.current.direction.length() >= 0.1) {
-        animation = movementRef.current.running ? "run" : "walk";
-      }
-    }
-
-    // Get the local player's current health
-    const localPlayer = playersRef.current.get(playerIdRef.current!);
-    const health = localPlayer?.health || MAX_PLAYER_HEALTH;
-
-    socketRef.current.send(
-      JSON.stringify({
-        type: "position",
-        data: {
-          position: { x: position.x, y: position.y, z: position.z },
-          rotation: rotation,
-          animation: animation,
-          health: health,
+    // IMPORTANT: Don't send health updates in position updates - server should be source of truth
+    // Only send position, rotation, animation and player identity info
+    const updateData = {
+      type: "position", // Using "position" type instead of "playerUpdate" for movement updates
+      data: {
+        id: playerIdRef.current,
+        position: {
+          x: position.x,
+          y: position.y,
+          z: position.z,
         },
-      })
-    );
+        rotation: rotation,
+        animation: animation,
+        // Include minimum identity data, but NOT health
+        name: localPlayer
+          ? localPlayer.name
+          : playerName || `Player ${playerIdRef.current}`,
+      },
+    };
+
+    socketRef.current.send(JSON.stringify(updateData));
   };
 
   // Function to create other player models
   const createOtherPlayer = (player: Player) => {
-    if (!sceneRef.current) {
-      console.warn("Cannot create player - scene not ready");
-      return;
-    }
-
     console.log(`Creating other player model for player ${player.id}`);
 
-    // Check if there's already a model for this player
+    // CRITICAL: Check if this player should be the local player
+    if (playerIdRef.current === null) {
+      // If we don't have a player ID yet, assume this is the local player
+      console.log(
+        `No player ID set yet, assuming ${player.id} is the local player`
+      );
+      playerIdRef.current = player.id;
+    } else if (
+      !playersRef.current.has(playerIdRef.current) &&
+      playersRef.current.size === 1
+    ) {
+      // If our player ID doesn't exist in the map but there's only one player, assume that's us
+      console.log(
+        `Player ID ${playerIdRef.current} not found in map, but only one player exists with ID ${player.id}`
+      );
+      console.log(
+        `Updating playerIdRef from ${playerIdRef.current} to ${player.id}`
+      );
+      playerIdRef.current = player.id;
+    }
+
+    // Check if this is actually the local player
+    if (player.id === playerIdRef.current) {
+      console.log(`This is the local player with ID ${player.id}`);
+
+      // If we have a name set, use it
+      if (playerName) {
+        console.log(`Setting local player name to "${playerName}"`);
+        player.name = playerName;
+
+        // Send name update to server
+        if (
+          socketRef.current &&
+          socketRef.current.readyState === WebSocket.OPEN
+        ) {
+          console.log(`Sending name update to server: "${playerName}"`);
+          socketRef.current.send(
+            JSON.stringify({
+              type: "updateName",
+              data: {
+                id: player.id,
+                name: playerName,
+              },
+            })
+          );
+        }
+      }
+    }
+
+    // If the player already has a model, remove it
     if (player.model) {
       console.log(`Removing existing model for player ${player.id}`);
-      sceneRef.current.remove(player.model);
+      if (sceneRef.current) {
+        sceneRef.current.remove(player.model);
+      }
     }
 
     // Load the character model
@@ -1470,6 +2261,7 @@ const Game: React.FC = () => {
       { url: "/model_run.gltf", name: "run" },
       { url: "/model_jump.gltf", name: "jump" },
       { url: "/model_punch_right.gltf", name: "punch" },
+      { url: "/model_die.gltf", name: "die" },
     ];
 
     const loader = new GLTFLoader();
@@ -1490,12 +2282,34 @@ const Game: React.FC = () => {
                 if (clip && player.mixer && player.actions) {
                   const action = player.mixer.clipAction(clip);
 
-                  // Configure action settings
-                  if (name === "jump" || name === "punch") {
+                  // Configure action settings based on animation type
+                  if (name === "jump") {
+                    // Configure jump animation for physics synchronization
+                    action.setLoop(THREE.LoopOnce, 1);
+                    action.clampWhenFinished = true;
+
+                    // For other players, use a standard time scale that looks good
+                    // We can't sync with their physics directly
+                    action.setEffectiveTimeScale(0.8); // Slower to match typical jump duration
+
+                    // CRITICAL FIX: Make sure the animation completes properly
+                    action.setDuration(clip.duration); // Use original duration
+
+                    // Ensure animation starts and ends cleanly
+                    action.zeroSlopeAtStart = false; // Start animation immediately
+                    action.zeroSlopeAtEnd = true; // Smooth end
+
+                    // Disable automatic crossfade for jump animation
+                    action.fadeIn(0);
+                    action.fadeOut(0.1); // Very short fade out
+                  } else if (name === "punch" || name === "die") {
+                    // Configure other one-time animations
                     action.setLoop(THREE.LoopOnce, 1);
                     action.clampWhenFinished = true;
                   } else {
+                    // Configure looping animations (idle, walk, run)
                     action.setLoop(THREE.LoopRepeat, Infinity);
+                    action.clampWhenFinished = false;
                   }
 
                   player.actions[name] = action;
@@ -1518,6 +2332,38 @@ const Game: React.FC = () => {
         })
       );
 
+      // Add a mixer event listener to detect when animations finish
+      if (player.mixer) {
+        player.mixer.addEventListener("finished", (e: any) => {
+          const action = e.action;
+
+          // Check if player has actions and if it's the jump animation that finished
+          if (player.actions && action === player.actions["jump"]) {
+            console.log(
+              `Jump animation finished via mixer event for player ${player.id}`
+            );
+
+            // Determine which animation to return to based on player state
+            let returnAnimation = "idle";
+
+            // If player is moving, use appropriate movement animation
+            if (
+              player.position.distanceTo(
+                player.model?.position || new THREE.Vector3()
+              ) > 0.1
+            ) {
+              // Assume running if moving (server should send correct animation)
+              returnAnimation = "run";
+            }
+
+            const returnAction = player.actions[returnAnimation];
+            if (returnAction) {
+              returnAction.reset().play();
+            }
+          }
+        });
+      }
+
       console.log(`All animations loaded for player ${player.id}`);
     } catch (error) {
       console.error(`Error loading animations for player ${player.id}:`, error);
@@ -1534,6 +2380,29 @@ const Game: React.FC = () => {
       return;
     }
 
+    // If this is the local player and we have a name set, make sure it's applied
+    if (
+      player.id === playerIdRef.current &&
+      playerName &&
+      player.name !== playerName
+    ) {
+      console.log(
+        `[createPlayerHealthBar] Local player name mismatch: "${player.name}" vs "${playerName}"`
+      );
+      player.name = playerName;
+
+      // Also update the player in the map
+      if (playersRef.current.has(player.id)) {
+        const mapPlayer = playersRef.current.get(player.id);
+        if (mapPlayer && mapPlayer.name !== playerName) {
+          console.log(
+            `[createPlayerHealthBar] Updating player in map: "${mapPlayer.name}" -> "${playerName}"`
+          );
+          mapPlayer.name = playerName;
+        }
+      }
+    }
+
     // Remove existing health bar if it exists
     if (player.healthBar && document.body.contains(player.healthBar)) {
       document.body.removeChild(player.healthBar);
@@ -1544,13 +2413,53 @@ const Game: React.FC = () => {
     healthBarContainer.style.cssText = `
       position: fixed;
       width: ${HEALTH_BAR_WIDTH}px;
-      height: ${HEALTH_BAR_HEIGHT}px;
-      border: 2px solid white;
-      background: rgba(102, 0, 0, 0.8);
       transform: translate(-50%, -50%);
       pointer-events: none;
       z-index: 1000;
-      display: none;
+      display: flex;
+      visibility: visible;
+      flex-direction: column;
+      align-items: center;
+    `;
+
+    // Create player name label
+    const nameLabel = document.createElement("div");
+
+    // IMPORTANT: Get the player name directly from the player object
+    // This ensures we're using the most up-to-date name
+    const currentPlayer = playersRef.current.get(player.id);
+    const playerNameFromRef = currentPlayer ? currentPlayer.name : null;
+
+    // Use the player's name if available, otherwise use "Player X"
+    const displayName =
+      playerNameFromRef || player.name || `Player ${player.id}`;
+    console.log(
+      `Setting health bar name label to: ${displayName} for player ${player.id}`
+    );
+
+    // Set the name label to just show the player name (no debug info)
+    nameLabel.textContent = displayName;
+
+    nameLabel.style.cssText = `
+      color: white;
+      font-size: 14px;
+      margin-bottom: 3px;
+      text-shadow: 1px 1px 2px black;
+      white-space: nowrap;
+      font-weight: bold;
+    `;
+
+    // Create health bar div
+    const healthBarDiv = document.createElement("div");
+    healthBarDiv.style.cssText = `
+      width: 100%;
+      height: ${HEALTH_BAR_HEIGHT}px;
+      border: 1px solid white;
+      background: rgba(102, 0, 0, 0.8);
+      position: relative;
+      overflow: hidden;
+      border-radius: 3px;
+      box-shadow: 0 0 5px rgba(0, 0, 0, 0.5);
     `;
 
     // Create foreground (health) div
@@ -1565,12 +2474,17 @@ const Game: React.FC = () => {
       transition: width 0.2s ease-out;
     `;
 
-    healthBarContainer.appendChild(healthBarForeground);
+    healthBarDiv.appendChild(healthBarForeground);
+    healthBarContainer.appendChild(nameLabel);
+    healthBarContainer.appendChild(healthBarDiv);
     document.body.appendChild(healthBarContainer);
 
     // Store references to DOM elements
     player.healthBar = healthBarContainer;
     player.healthBarForeground = healthBarForeground;
+
+    // Update the position immediately
+    updateHealthBarPosition(player);
   };
 
   // Function to update health bar position
@@ -1580,39 +2494,76 @@ const Game: React.FC = () => {
       !player.healthBar ||
       !cameraRef.current ||
       !rendererRef.current
-    )
+    ) {
       return;
+    }
 
-    // Get the position of the player's head in world space
+    // Get the position of the player's model in world space
     const position = new THREE.Vector3();
+    // Position the health bar above the player's head
     player.model.getWorldPosition(position);
-    position.y += 1.8; // Reduced from 2.5 to 1.8 to be closer to the head
+    position.y += 1.8; // Adjust this value to position the health bar above the player's head
 
-    // Project the 3D position to 2D screen coordinates
+    // Project the 3D position to 2D screen space
     const screenPosition = position.clone();
     screenPosition.project(cameraRef.current);
 
-    // Convert to pixel coordinates
-    const x = ((screenPosition.x + 1) * window.innerWidth) / 2;
-    const y = ((-screenPosition.y + 1) * window.innerHeight) / 2;
+    // Convert to CSS coordinates
+    const x =
+      ((screenPosition.x + 1) / 2) * rendererRef.current.domElement.clientWidth;
+    const y =
+      ((1 - screenPosition.y) / 2) *
+      rendererRef.current.domElement.clientHeight;
 
-    // Only show health bar if player is in front of the camera
+    // Only show the health bar if the player is in front of the camera
+    // Use display property to show/hide based on camera position
     player.healthBar.style.display = screenPosition.z > 1 ? "none" : "block";
 
-    // Update position
+    // Update the position of the health bar
     player.healthBar.style.left = `${x}px`;
     player.healthBar.style.top = `${y}px`;
   };
 
   // Function to update player health bar
   const updatePlayerHealthBar = (player: Player) => {
+    console.log(
+      `Updating health bar for player ${player.id}, health=${player.health}/${player.maxHealth}`
+    );
+
     if (!player.healthBar || !player.healthBarForeground) {
+      console.warn(`No health bar for player ${player.id}, creating one`);
       createPlayerHealthBar(player);
       return;
     }
 
+    // If this is the local player and we have a name set, make sure it's applied
+    if (
+      player.id === playerIdRef.current &&
+      playerName &&
+      player.name !== playerName
+    ) {
+      console.log(
+        `[updatePlayerHealthBar] Local player name mismatch: "${player.name}" vs "${playerName}"`
+      );
+      player.name = playerName;
+    }
+
+    // Update the health bar width based on current health
     const healthRatio = Math.max(0, player.health / player.maxHealth);
+    console.log(
+      `Setting health bar width for player ${player.id} to ${
+        healthRatio * 100
+      }%`
+    );
+
+    // Directly update the DOM element
     player.healthBarForeground.style.width = `${healthRatio * 100}%`;
+
+    // For debugging: force a redraw
+    const currentDisplay = player.healthBarForeground.style.display;
+    player.healthBarForeground.style.display = "none";
+    void player.healthBarForeground.offsetHeight; // Force a reflow
+    player.healthBarForeground.style.display = currentDisplay;
 
     // Change color based on health level
     if (healthRatio < 0.3) {
@@ -1622,6 +2573,33 @@ const Game: React.FC = () => {
     } else {
       player.healthBarForeground.style.background = "#00ff00"; // Green when high health
     }
+
+    // Update player name if it changed
+    if (player.healthBar.firstChild instanceof HTMLDivElement) {
+      const nameLabel = player.healthBar.firstChild;
+
+      // IMPORTANT: Get the player name directly from the player object in the map
+      // This ensures we're using the most up-to-date name
+      const currentPlayer = playersRef.current.get(player.id);
+      const playerNameFromRef = currentPlayer ? currentPlayer.name : null;
+
+      // Use the player's name if available, otherwise use "Player X"
+      const displayName =
+        playerNameFromRef || player.name || `Player ${player.id}`;
+
+      // Add debug info to the displayed name
+      const debugName = `${displayName} [ID:${player.id}, Raw:${
+        playerNameFromRef || player.name
+      }]`;
+
+      // Only update if the name has changed
+      if (nameLabel.textContent !== debugName) {
+        console.log(
+          `Updating health bar name from ${nameLabel.textContent} to ${debugName} for player ${player.id}`
+        );
+        nameLabel.textContent = displayName;
+      }
+    }
   };
 
   // Function to handle player defeat
@@ -1630,9 +2608,32 @@ const Game: React.FC = () => {
 
     console.log(`Player ${player.id} DEFEATED! Playing death animation...`);
 
+    // Increment deaths counter
+    player.deaths = (player.deaths || 0) + 1;
+
+    // Update player stats for scoreboard if visible
+    if (showScoreboard && playersRef.current) {
+      // Create a new array with the updated stats
+      const updatedStats = Array.from(playersRef.current.values()).map((p) => ({
+        id: p.id,
+        kills: p.kills || 0,
+        deaths: p.deaths || 0,
+        name: p.name || `Player ${p.id}`,
+      }));
+
+      // Sort by kills (highest first)
+      updatedStats.sort((a, b) => b.kills - a.kills);
+
+      // Force update by creating a new array
+      setPlayerStats([...updatedStats]);
+
+      // Log the updated stats for debugging
+      console.log("Player stats updated after defeat:", updatedStats);
+    }
+
     // Hide health bar
     if (player.healthBar) {
-      player.healthBar.style.display = "none";
+      player.healthBar.style.visibility = "hidden";
     }
 
     // Stop any current animations
@@ -1640,36 +2641,41 @@ const Game: React.FC = () => {
       Object.values(player.actions).forEach((action) => {
         action.stop();
       });
-    }
 
-    // Create a simple death animation using tweening
-    const startRotation = player.model.rotation.x;
-    const startHeight = player.model.position.y;
-    const fallDuration = 1000; // 1 second
-    const startTime = performance.now();
+      // Play the death animation if available
+      if (player.actions["die"]) {
+        const dieAction = player.actions["die"];
+        dieAction.reset();
+        dieAction.setLoop(THREE.LoopOnce, 1);
+        dieAction.clampWhenFinished = true;
+        dieAction.play();
 
-    // Animate the fall
-    const animateDeath = () => {
-      const now = performance.now();
-      const elapsed = now - startTime;
-      const progress = Math.min(1, elapsed / fallDuration);
+        // Listen for animation completion
+        const onAnimationFinished = (e: any) => {
+          if (player.mixer) {
+            player.mixer.removeEventListener("finished", onAnimationFinished);
+          }
+          console.log(`Death animation completed for player ${player.id}`);
 
-      if (progress < 1 && player.model) {
-        // Rotate forward and lower to ground
-        player.model.rotation.x = startRotation + (Math.PI / 2) * progress;
-        player.model.position.y = startHeight * (1 - progress) + 0.2 * progress;
+          // Check if this is the local player
+          if (player.id === playerIdRef.current) {
+            // Show respawn menu for local player
+            setIsRespawning(true);
+          }
+        };
 
-        // Continue animation
-        requestAnimationFrame(animateDeath);
-      } else if (player.model) {
-        // Ensure final position
-        player.model.rotation.x = Math.PI / 2;
-        player.model.position.y = 0.2;
+        if (player.mixer) {
+          player.mixer.addEventListener("finished", onAnimationFinished);
+        }
+      } else {
+        console.warn(`No death animation available for player ${player.id}`);
+
+        // If no death animation, still show respawn menu for local player
+        if (player.id === playerIdRef.current) {
+          setIsRespawning(true);
+        }
       }
-    };
-
-    // Start death animation
-    animateDeath();
+    }
 
     // Add a dramatic red flash to the scene
     const flashGeometry = new THREE.SphereGeometry(2, 16, 16);
@@ -1685,7 +2691,7 @@ const Game: React.FC = () => {
 
     // Animate the flash
     const flashStartTime = performance.now();
-    const flashDuration = 500; // 0.5 seconds
+    const flashDuration = 500;
 
     const animateFlash = () => {
       const now = performance.now();
@@ -1704,36 +2710,40 @@ const Game: React.FC = () => {
 
     animateFlash();
 
-    // Respawn player after 3 seconds
-    setTimeout(() => {
-      if (player.model) {
-        // Reset health
-        player.health = player.maxHealth;
+    // Only respawn non-local players automatically
+    // Local player will respawn through the menu
+    if (player.id !== playerIdRef.current) {
+      // Respawn player after 3 seconds
+      setTimeout(() => {
+        if (player.model) {
+          // Reset health
+          player.health = player.maxHealth;
 
-        // Reset position to a random location
-        player.model.position.set(
-          Math.random() * 10 - 5,
-          0,
-          Math.random() * 10 - 5
-        );
+          // Reset position to a random location
+          player.model.position.set(
+            Math.random() * 10 - 5,
+            0,
+            Math.random() * 10 - 5
+          );
 
-        // Reset rotation
-        player.model.rotation.x = 0;
+          // Reset rotation
+          player.model.rotation.x = 0;
 
-        // Show health bar again
-        if (player.healthBar) {
-          player.healthBar.style.display = "block";
-          updatePlayerHealthBar(player);
+          // Show health bar again
+          if (player.healthBar) {
+            player.healthBar.style.visibility = "visible";
+            updatePlayerHealthBar(player);
+          }
+
+          // Reset to idle animation
+          if (player.actions && player.actions["idle"]) {
+            player.actions["idle"].reset().play();
+          }
+
+          console.log(`Player ${player.id} respawned!`);
         }
-
-        // Reset to idle animation
-        if (player.actions && player.actions["idle"]) {
-          player.actions["idle"].reset().play();
-        }
-
-        console.log(`Player ${player.id} respawned!`);
-      }
-    }, 3000);
+      }, 3000);
+    }
   };
 
   // Function to get the direction from the player to the cursor
@@ -1879,9 +2889,12 @@ const Game: React.FC = () => {
   const fireFireball = () => {
     if (!modelRef.current || !sceneRef.current || !cameraRef.current) return;
 
-    // Check cooldown
+    // Get configuration from control panel
+    const config = getConfig();
+
+    // Check cooldown using the control panel value
     const now = performance.now() / 1000; // Convert to seconds
-    if (now - lastFireballTimeRef.current < fireballCooldownRef.current) {
+    if (now - lastFireballTimeRef.current < config.fireball.cooldown) {
       return; // Still on cooldown
     }
     lastFireballTimeRef.current = now;
@@ -1889,11 +2902,7 @@ const Game: React.FC = () => {
     // Try to play a punch animation if available
     if (actionsRef.current && actionsRef.current["punch"]) {
       // Get the current animation state name as a string
-      // Make sure it's a string, not an AnimationAction object
-      const currentAnimName: string =
-        typeof actionsRef.current.currentAnimation === "string"
-          ? actionsRef.current.currentAnimation
-          : "idle";
+      const currentAnimName: string = currentAnimationRef.current;
 
       // Play the punch animation
       const punchAction = actionsRef.current["punch"];
@@ -1917,65 +2926,73 @@ const Game: React.FC = () => {
       }
     }
 
-    // Starting position (lower on the model - hands/waist level)
-    const startPosition = modelRef.current.position.clone();
-    startPosition.y += 0.8; // Lower position (was 1.2 for chest height)
-
-    // Offset slightly forward from the character
-    const characterDirection = new THREE.Vector3(0, 0, 1).applyAxisAngle(
-      new THREE.Vector3(0, 1, 0),
-      modelRef.current.rotation.y
+    // IMPROVED AIMING: Use the camera's exact ray for perfect aiming
+    const raycaster = new THREE.Raycaster();
+    raycaster.setFromCamera(
+      new THREE.Vector2(mouseRef.current.x, mouseRef.current.y),
+      cameraRef.current
     );
-    startPosition.add(characterDirection.multiplyScalar(0.3)); // Offset forward slightly
 
-    // Use the pre-calculated cursor world position as target
-    const targetPosition = cursorWorldPositionRef.current.clone();
+    // Find where the ray intersects with objects or extends into the distance
+    let targetPoint = new THREE.Vector3();
+    const intersects = raycaster.intersectObjects(
+      collidableObjectsRef.current,
+      true
+    );
 
-    // Calculate direction from start to cursor position
+    if (intersects.length > 0) {
+      // Ray hit something - use the intersection point
+      targetPoint.copy(intersects[0].point);
+    } else {
+      // Ray didn't hit anything - extend the ray to a reasonable distance
+      raycaster.ray.at(100, targetPoint);
+    }
+
+    // Starting position (from player's hands/waist level)
+    const startPosition = modelRef.current.position.clone();
+    startPosition.y += 0.8; // Adjust to hands/waist level
+
+    // Calculate the exact direction from start position to target point
+    // This ensures the fireball will always hit the target regardless of camera position
     const direction = new THREE.Vector3()
-      .subVectors(targetPosition, startPosition)
+      .subVectors(targetPoint, startPosition)
       .normalize();
 
-    // Create the burst effect at the starting position
+    // Create visual effects
     createBurstEffect(startPosition, direction);
 
-    // Create a visual debug sphere at target position (helpful for debugging)
-    const targetMarker = new THREE.Mesh(
-      new THREE.SphereGeometry(0.1, 8, 8),
-      new THREE.MeshBasicMaterial({ color: 0xff0000 })
-    );
-    targetMarker.position.copy(targetPosition);
-    sceneRef.current.add(targetMarker);
-    setTimeout(() => {
-      sceneRef.current?.remove(targetMarker);
-    }, 500);
-
-    // Create fireball mesh
-    const geometry = new THREE.SphereGeometry(0.2, 16, 16);
+    // Create fireball mesh with size from config
+    const geometry = new THREE.SphereGeometry(config.fireball.size, 16, 16);
     const material = new THREE.MeshStandardMaterial({
       color: 0xff4500,
-      emissive: 0xff7700,
-      emissiveIntensity: 2,
+      emissive: 0xff2000,
+      emissiveIntensity: 0.5,
+      transparent: true,
+      opacity: 0.9,
     });
 
     const fireball = new THREE.Mesh(geometry, material);
     fireball.position.copy(startPosition);
 
-    // Store metadata
+    // Add a point light to the fireball
+    const light = new THREE.PointLight(0xff4500, 1, 3);
+    light.position.set(0, 0, 0);
+    fireball.add(light);
+
+    // Store direction and other metadata in userData
     fireball.userData.direction = direction;
     fireball.userData.createdTime = now;
     fireball.userData.ownerId = playerIdRef.current;
-    fireball.userData.speed = 30; // Faster speed for more responsive feel
+    fireball.userData.speed = config.fireball.speed;
+    fireball.userData.targetPoint = targetPoint.clone(); // Store target point for precise aiming
+    fireball.userData.startPosition = startPosition.clone(); // Store start position for trajectory calculation
+    fireball.userData.distanceToTarget = startPosition.distanceTo(targetPoint); // Store distance to target
 
     // Add to scene and tracking array
     sceneRef.current.add(fireball);
     fireballsRef.current.push(fireball);
 
-    // Add point light for glow effect
-    const light = new THREE.PointLight(0xff5500, 1, 2);
-    fireball.add(light);
-
-    // Send fireball to server
+    // Send fireball data to server
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
       socketRef.current.send(
         JSON.stringify({
@@ -1991,166 +3008,234 @@ const Game: React.FC = () => {
               y: direction.y,
               z: direction.z,
             },
+            targetPoint: {
+              x: targetPoint.x,
+              y: targetPoint.y,
+              z: targetPoint.z,
+            },
+            speed: config.fireball.speed,
+            damage: config.fireball.damage,
           },
         })
       );
     }
+
+    // ... rest of the function ...
   };
 
   // Function to update fireballs position and check collisions
   const updateFireballs = (delta: number) => {
-    const now = performance.now() / 1000;
+    if (!sceneRef.current) return;
 
-    // Update each fireball position
+    // Get configuration from control panel
+    const config = getConfig();
+
+    // Update each fireball
     for (let i = fireballsRef.current.length - 1; i >= 0; i--) {
       const fireball = fireballsRef.current[i];
       const direction = fireball.userData.direction;
-      const speed = fireball.userData.speed || 30; // Use stored speed or default to 30
+
+      // Use the speed from the fireball's userData, which is set from the config
+      const speed = fireball.userData.speed;
 
       // Move fireball
-      fireball.position.add(direction.clone().multiplyScalar(speed * delta));
+      fireball.position.x += direction.x * speed * delta;
+      fireball.position.y += direction.y * speed * delta;
+      fireball.position.z += direction.z * speed * delta;
 
-      // Rotate the fireball for visual effect
+      // Rotate fireball for visual effect
       fireball.rotation.x += 5 * delta;
       fireball.rotation.z += 5 * delta;
 
-      // Check lifetime (remove after 3 seconds)
-      if (now - fireball.userData.createdTime > 3) {
-        sceneRef.current?.remove(fireball);
-        fireballsRef.current.splice(i, 1);
-        continue;
+      // Check if fireball has reached or passed its target point
+      if (fireball.userData.targetPoint) {
+        const distanceFromStart = fireball.userData.startPosition.distanceTo(
+          fireball.position
+        );
+
+        if (distanceFromStart >= fireball.userData.distanceToTarget) {
+          // Snap to exact target position
+          fireball.position.copy(fireball.userData.targetPoint);
+
+          // Create explosion effect at target
+          createHitEffect(fireball.userData.targetPoint);
+          createExplosionEffect(
+            fireball.userData.targetPoint,
+            config.fireball.explosionSize,
+            0xffaa00
+          );
+
+          // Remove fireball
+          if (sceneRef.current) {
+            sceneRef.current.remove(fireball);
+          }
+          fireballsRef.current.splice(i, 1);
+          continue;
+        }
       }
 
-      // Check collision with environment
-      const raycaster = new THREE.Raycaster(
-        fireball.position.clone().sub(direction.clone().multiplyScalar(0.2)), // Start slightly behind
-        direction.clone(),
-        0,
-        0.5
-      );
-      const intersects = raycaster.intersectObjects(
-        collidableObjectsRef.current,
-        true
-      );
-      if (intersects.length > 0) {
-        // Hit environment, remove fireball
-        sceneRef.current?.remove(fireball);
-        fireballsRef.current.splice(i, 1);
-
-        // Create hit effect at collision point
-        createHitEffect(intersects[0].point);
-        continue;
-      }
-
-      // Flag to track if fireball has hit something
-      let fireballHit = false;
-
-      // Check collision with other players
-      playersRef.current.forEach((player, playerId) => {
-        // Skip if fireball already hit something or belongs to this player
+      // Check for collisions with players
+      let hitDetected = false;
+      playersRef.current.forEach((player) => {
         if (
-          fireballHit ||
-          playerId === fireball.userData.ownerId ||
-          !player.model
+          hitDetected ||
+          !player.model ||
+          player.id === fireball.userData.ownerId || // Changed from !== to === (we don't want to hit ourselves)
+          player.health <= 0
         ) {
           return;
         }
 
-        // Calculate player center (at chest height)
-        const playerCenter = player.model.position.clone();
-        playerCenter.y += 1.0; // Chest height
+        // Simple sphere-based collision detection
+        const playerPosition = player.model.position.clone();
+        playerPosition.y += 1; // Adjust to center of player
+        const distance = playerPosition.distanceTo(fireball.position);
 
-        // Check distance between fireball and player center
-        const distance = fireball.position.distanceTo(playerCenter);
-        if (distance < 1.2) {
-          // Increased hit radius for better detection
-          fireballHit = true;
+        if (distance < 1) {
+          // Hit detected
+          hitDetected = true;
+          console.log(`Player ${player.id} hit by fireball!`);
 
-          // Apply damage to the player (30% of max health)
-          const damageAmount = player.maxHealth * 0.3;
-          const newHealth = Math.max(0, player.health - damageAmount);
-
-          console.log(
-            `DIRECT HIT on Player ${playerId}! Health: ${player.health} -> ${newHealth}`
+          // Create hit effect
+          createHitEffect(fireball.position);
+          createExplosionEffect(
+            fireball.position,
+            config.fireball.explosionSize,
+            0xffaa00
           );
 
-          // Update player health
-          player.health = newHealth;
+          // Apply damage to player
+          const damage = config.fireball.damage || 0;
+          player.health = Math.max(0, player.health - damage);
 
-          // Update the player's health bar
-          if (playerId === playerIdRef.current) {
-            // This is the local player being hit
-            console.log("Local player hit, updating health bar");
-            updateLocalPlayerHealthBar(player.health);
+          console.log(
+            `Player ${player.id} hit by fireball! Damage: ${damage}, New health: ${player.health}`
+          );
 
-            // Send health update to server
-            if (
-              socketRef.current &&
-              socketRef.current.readyState === WebSocket.OPEN
-            ) {
-              socketRef.current.send(
-                JSON.stringify({
-                  type: "playerUpdate",
-                  data: {
-                    id: playerIdRef.current,
-                    position: {
-                      x: modelRef.current?.position.x || 0,
-                      y: modelRef.current?.position.y || 0,
-                      z: modelRef.current?.position.z || 0,
-                    },
-                    rotation: modelRef.current?.rotation.y || 0,
-                    animation: actionsRef.current?.currentAnimation || "idle",
-                    health: player.health,
-                    maxHealth: player.maxHealth,
-                  },
-                })
-              );
-            }
-          } else if (fireball.userData.ownerId === playerIdRef.current) {
-            // We hit another player
-            console.log("We hit another player, sending direct damage message");
+          // Update player's health bar
+          updatePlayerHealthBar(player);
 
-            // Update their health bar locally
-            updatePlayerHealthBar(player);
-
-            // Send direct damage message to server
-            if (
-              socketRef.current &&
-              socketRef.current.readyState === WebSocket.OPEN
-            ) {
-              socketRef.current.send(
-                JSON.stringify({
-                  type: "directDamage",
-                  data: {
-                    targetId: playerId,
-                    newHealth: player.health,
-                    damage: damageAmount,
-                  },
-                })
-              );
-            }
-          }
-
-          // Add hit effect (red flash)
+          // Add hit effect to player
           addHitEffect(player);
 
-          // If player is defeated
+          // Check if player is defeated
           if (player.health <= 0) {
-            // Handle player defeat
             handlePlayerDefeat(player);
           }
 
-          // Add visual effects for the hit
-          createHitEffect(playerCenter.clone());
+          // Remove fireball
+          if (sceneRef.current) {
+            sceneRef.current.remove(fireball);
+          }
+          fireballsRef.current.splice(i, 1);
+
+          // Send hit event to server
+          if (
+            socketRef.current &&
+            socketRef.current.readyState === WebSocket.OPEN
+          ) {
+            socketRef.current.send(
+              JSON.stringify({
+                type: "directDamage",
+                data: {
+                  targetId: player.id,
+                  damage: config.fireball.damage || 0,
+                  newHealth: player.health,
+                  position: {
+                    x: fireball.position.x,
+                    y: fireball.position.y,
+                    z: fireball.position.z,
+                  },
+                },
+              })
+            );
+          }
         }
       });
 
-      // Remove fireball if it hit something
-      if (fireballHit) {
-        sceneRef.current?.remove(fireball);
+      // Skip the rest of the loop if a hit was detected
+      if (hitDetected) {
+        continue;
+      }
+
+      // Check for collisions with obstacles
+      const obstacleCollision = checkObstacleCollisions(fireball.position);
+      if (obstacleCollision) {
+        // Create hit effect
+        createHitEffect(fireball.position);
+        createExplosionEffect(
+          fireball.position,
+          config.fireball.explosionSize,
+          0xffaa00
+        );
+
+        // Remove fireball
+        if (sceneRef.current) {
+          sceneRef.current.remove(fireball);
+        }
+        fireballsRef.current.splice(i, 1);
+        continue;
+      }
+
+      // Remove fireballs that have been alive too long (5 seconds)
+      const age = performance.now() / 1000 - fireball.userData.createdTime;
+      if (age > 5) {
+        if (sceneRef.current) {
+          sceneRef.current.remove(fireball);
+        }
         fireballsRef.current.splice(i, 1);
       }
     }
+  };
+
+  // Create a small explosion effect
+  const createExplosionEffect = (
+    position: THREE.Vector3,
+    size: number,
+    color: number
+  ) => {
+    if (!sceneRef.current) return;
+
+    // Create explosion sphere
+    const explosionGeometry = new THREE.SphereGeometry(size, 16, 16);
+    const explosionMaterial = new THREE.MeshBasicMaterial({
+      color: color,
+      transparent: true,
+      opacity: 0.7,
+    });
+
+    const explosion = new THREE.Mesh(explosionGeometry, explosionMaterial);
+    explosion.position.copy(position);
+    sceneRef.current.add(explosion);
+
+    // Add light for glow effect
+    const light = new THREE.PointLight(color, 2, size * 5);
+    light.position.copy(position);
+    sceneRef.current.add(light);
+
+    // Animate explosion
+    const startTime = performance.now();
+    const duration = 300; // milliseconds
+
+    const animateExplosion = () => {
+      const elapsed = performance.now() - startTime;
+      const progress = Math.min(1, elapsed / duration);
+
+      if (progress < 1) {
+        // Expand and fade out
+        explosion.scale.setScalar(1 + progress * 2);
+        explosionMaterial.opacity = 0.7 * (1 - progress);
+        light.intensity = 2 * (1 - progress);
+
+        requestAnimationFrame(animateExplosion);
+      } else {
+        // Remove from scene
+        sceneRef.current?.remove(explosion);
+        sceneRef.current?.remove(light);
+      }
+    };
+
+    animateExplosion();
   };
 
   // Add the main initialization useEffect
@@ -2184,6 +3269,9 @@ const Game: React.FC = () => {
     renderer.setClearColor(0x87ceeb, 1); // Sky blue background
     containerRef.current.appendChild(renderer.domElement);
     rendererRef.current = renderer;
+
+    // Initialize the control panel
+    controlPanelRef.current = initControlPanel();
 
     // Lighting
     const ambientLight = new THREE.AmbientLight(0xffffff, 1);
@@ -2296,6 +3384,22 @@ const Game: React.FC = () => {
 
       socket.onopen = () => {
         console.log("Connected to WebSocket server");
+
+        // If we already have a player name, send it to the server immediately
+        if (playerName && playerIdRef.current) {
+          console.log(
+            `Sending player name "${playerName}" to server on connection`
+          );
+          socket.send(
+            JSON.stringify({
+              type: "updateName",
+              data: {
+                id: playerIdRef.current,
+                name: playerName,
+              },
+            })
+          );
+        }
       };
 
       socket.onmessage = (event) => {
@@ -2341,47 +3445,36 @@ const Game: React.FC = () => {
 
     // Cleanup function
     return () => {
+      // ... existing cleanup code ...
+
+      // Remove event listeners
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
       window.removeEventListener("resize", handleResize);
       window.removeEventListener("click", handleMouseClick);
 
+      // Dispose of resources
       if (rendererRef.current && containerRef.current) {
         containerRef.current.removeChild(rendererRef.current.domElement);
-        rendererRef.current.dispose();
       }
 
-      // Reset flag if component is unmounting for real (not just in StrictMode)
-      setTimeout(() => {
-        modelLoadedRef.current = false;
-      }, 100);
+      // Clear intervals
+      if (syncIntervalRef.current) {
+        clearInterval(syncIntervalRef.current);
+      }
 
+      // Close WebSocket
       if (socketRef.current) {
         socketRef.current.close();
       }
 
-      // Remove all other player models
-      playersRef.current.forEach((player) => {
-        if (player.model && sceneRef.current) {
-          sceneRef.current.remove(player.model);
-        }
-      });
-      playersRef.current.clear();
-
-      // Remove all health bar elements
-      playersRef.current.forEach((player) => {
-        if (player.healthBar && document.body.contains(player.healthBar)) {
-          document.body.removeChild(player.healthBar);
-        }
-      });
-
-      // Clear the sync interval
-      if (syncIntervalRef.current) {
-        clearInterval(syncIntervalRef.current);
-        syncIntervalRef.current = null;
+      // Remove the control panel container if it exists
+      const container = document.querySelector(".tp-dfwv");
+      if (container && container.parentNode) {
+        container.parentNode.removeChild(container);
       }
     };
-  }, []); // Empty dependency array since we want this to run once
+  }, []);
 
   // Add cursor position tracking for raycasting
   const cursorWorldPositionRef = useRef(new THREE.Vector3());
@@ -2497,10 +3590,7 @@ const Game: React.FC = () => {
   const addHitEffect = (player: Player) => {
     if (!player.model) return;
 
-    // Store the current time of hit
-    player.lastHitTime = performance.now() / 1000;
-
-    // Apply red tint to the player model
+    // Flash the player model red
     player.model.traverse((child) => {
       if (child instanceof THREE.Mesh && child.material) {
         if (Array.isArray(child.material)) {
@@ -2524,7 +3614,7 @@ const Game: React.FC = () => {
       }
     });
 
-    // Reset color after a short time
+    // Reset color after a short delay
     setTimeout(() => {
       if (player.model) {
         player.model.traverse((child) => {
@@ -2544,6 +3634,591 @@ const Game: React.FC = () => {
     }, 200);
   };
 
+  // Add state for scoreboard visibility
+  const [showScoreboard, setShowScoreboard] = useState(false);
+
+  useEffect(() => {
+    // ... existing code ...
+
+    // Add Tab key handler for scoreboard
+    const handleKeyDownForScoreboard = (event: KeyboardEvent) => {
+      if (event.key === "Tab") {
+        event.preventDefault(); // Prevent default tab behavior
+
+        // Update player stats when showing scoreboard
+        if (playersRef.current) {
+          // Create a new array with the updated stats
+          const updatedStats = Array.from(playersRef.current.values()).map(
+            (player) => ({
+              id: player.id,
+              kills: player.kills || 0,
+              deaths: player.deaths || 0,
+              name: player.name || `Player ${player.id}`,
+            })
+          );
+
+          // Sort by kills (highest first)
+          updatedStats.sort((a, b) => b.kills - a.kills);
+
+          // Force update by creating a new array
+          setPlayerStats([...updatedStats]);
+
+          // Log the updated stats for debugging
+          console.log("Tab key pressed, updated player stats:", updatedStats);
+        }
+
+        setShowScoreboard(true);
+      }
+    };
+
+    const handleKeyUpForScoreboard = (event: KeyboardEvent) => {
+      if (event.key === "Tab") {
+        setShowScoreboard(false);
+      }
+    };
+
+    // Add event listeners for scoreboard
+    window.addEventListener("keydown", handleKeyDownForScoreboard);
+    window.addEventListener("keyup", handleKeyUpForScoreboard);
+
+    // ... existing code ...
+
+    // Cleanup function
+    return () => {
+      // ... existing code ...
+
+      // Remove scoreboard event listeners
+      window.removeEventListener("keydown", handleKeyDownForScoreboard);
+      window.removeEventListener("keyup", handleKeyUpForScoreboard);
+
+      // ... existing code ...
+    };
+  }, []);
+
+  // Function to update player stats for the scoreboard
+  const updatePlayerStats = () => {
+    if (!playersRef.current) return;
+
+    const stats: Array<{
+      id: number;
+      kills: number;
+      deaths: number;
+      name: string;
+    }> = [];
+
+    // Convert players map to array of stats objects
+    playersRef.current.forEach((player) => {
+      stats.push({
+        id: player.id,
+        kills: player.kills || 0,
+        deaths: player.deaths || 0,
+        name: player.name || `Player ${player.id}`,
+      });
+    });
+
+    // Sort by kills (highest first)
+    stats.sort((a, b) => b.kills - a.kills);
+
+    setPlayerStats(stats);
+  };
+
+  // Render the scoreboard
+  const renderScoreboard = () => {
+    if (!showScoreboard) return null;
+
+    // Log the current player stats for debugging
+    console.log("Rendering scoreboard with stats:", playerStats);
+
+    return (
+      <div className="scoreboard">
+        <div className="scoreboard-header">Scoreboard</div>
+        <div className="scoreboard-content">
+          <div className="scoreboard-row header">
+            <div style={{ flex: 2 }}>Player</div>
+            <div>Kills</div>
+            <div>Deaths</div>
+            <div>K/D</div>
+          </div>
+          {playerStats.length > 0 ? (
+            playerStats.map((player) => {
+              const kills = player.kills;
+              const deaths = player.deaths;
+              const kd =
+                deaths > 0 ? (kills / deaths).toFixed(2) : kills.toFixed(2);
+              const isLocalPlayer = player.id === playerIdRef.current;
+              const displayName = player.name || `Player ${player.id}`;
+
+              return (
+                <div
+                  key={player.id}
+                  className={`scoreboard-row ${
+                    isLocalPlayer ? "local-player" : ""
+                  }`}
+                >
+                  <div
+                    style={{
+                      flex: 2,
+                      fontWeight: isLocalPlayer ? "bold" : "normal",
+                      color: isLocalPlayer ? "#ffff00" : "white",
+                    }}
+                  >
+                    {displayName}
+                  </div>
+                  <div>{kills}</div>
+                  <div>{deaths}</div>
+                  <div>{kd}</div>
+                </div>
+              );
+            })
+          ) : (
+            <div className="scoreboard-row">
+              <div style={{ textAlign: "center", width: "100%" }}>
+                No players yet
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  // Add state for player stats
+  const [playerStats, setPlayerStats] = useState<
+    Array<{ id: number; kills: number; deaths: number; name: string }>
+  >([]);
+
+  // Function to update a player's name
+  const updatePlayerName = (playerId: number, newName: string) => {
+    console.log(`Attempting to update player ${playerId} name to "${newName}"`);
+
+    // Check if the player exists in the map
+    if (!playersRef.current.has(playerId)) {
+      console.warn(
+        `Cannot update name: Player ${playerId} not found in playersRef`
+      );
+      console.log("Current players:", Array.from(playersRef.current.keys()));
+      return;
+    }
+
+    const player = playersRef.current.get(playerId);
+    if (player) {
+      const oldName = player.name || `Player ${playerId}`;
+      player.name = newName;
+      console.log(
+        `Updated player ${playerId} name from "${oldName}" to "${newName}"`
+      );
+      console.log(`Player object after update:`, {
+        id: player.id,
+        name: player.name,
+        health: player.health,
+        hasHealthBar: !!player.healthBar,
+      });
+
+      // Update the health bar if it exists
+      if (player.healthBar) {
+        console.log(`Updating health bar for player ${playerId}`);
+        updatePlayerHealthBar(player);
+      } else {
+        console.log(`No health bar found for player ${playerId}, creating one`);
+        createPlayerHealthBar(player);
+      }
+
+      // Update player stats if scoreboard is visible
+      if (showScoreboard) {
+        updatePlayerStats();
+      }
+    }
+  };
+
+  // Add a useEffect to check if the player name is being properly set
+  useEffect(() => {
+    // This will run whenever playerName or playerIdRef.current changes
+    console.log(`[useEffect] playerName changed to: "${playerName}"`);
+    console.log(`[useEffect] Current playerIdRef: ${playerIdRef.current}`);
+    console.log(
+      `[useEffect] Current players in playersRef:`,
+      Array.from(playersRef.current.keys())
+    );
+
+    // If we have a player name but no player ID yet, wait for the ID to be assigned
+    if (playerName && !playerIdRef.current) {
+      console.log(
+        `[useEffect] Have player name but no ID yet, waiting for ID to be assigned`
+      );
+      return;
+    }
+
+    // If we have a player name and ID, check if the player exists
+    if (playerName && playerIdRef.current) {
+      console.log(
+        `[useEffect] Have player name "${playerName}" and ID ${playerIdRef.current}`
+      );
+
+      // Check if the player exists in the map
+      if (playersRef.current.has(playerIdRef.current)) {
+        console.log(
+          `[useEffect] Player ${playerIdRef.current} exists in playersRef`
+        );
+        const player = playersRef.current.get(playerIdRef.current);
+
+        if (player) {
+          console.log(`[useEffect] Current player object:`, {
+            id: player.id,
+            name: player.name,
+            hasHealthBar: !!player.healthBar,
+          });
+
+          // If the player name doesn't match, update it
+          if (player.name !== playerName) {
+            console.log(
+              `[useEffect] Fixing player name mismatch: "${player.name}" -> "${playerName}"`
+            );
+
+            // Directly set the name on the player object
+            player.name = playerName;
+
+            // Update the health bar if it exists
+            if (player.healthBar) {
+              console.log(`[useEffect] Updating health bar with new name`);
+              updatePlayerHealthBar(player);
+            }
+
+            // Update player stats if scoreboard is visible
+            if (showScoreboard) {
+              updatePlayerStats();
+            }
+
+            // Send the name update to the server
+            if (
+              socketRef.current &&
+              socketRef.current.readyState === WebSocket.OPEN
+            ) {
+              console.log(
+                `[useEffect] Sending name update to server: "${playerName}"`
+              );
+              socketRef.current.send(
+                JSON.stringify({
+                  type: "updateName",
+                  data: {
+                    id: playerIdRef.current,
+                    name: playerName,
+                  },
+                })
+              );
+            }
+          } else {
+            console.log(
+              `[useEffect] Player name is already correct: "${player.name}"`
+            );
+          }
+        }
+      } else {
+        console.log(
+          `[useEffect] Player ${playerIdRef.current} not found in playersRef yet`
+        );
+        console.log(
+          `[useEffect] Will apply name "${playerName}" when player is created`
+        );
+
+        // Set up a watcher to check when the player is created
+        const checkInterval = setInterval(() => {
+          console.log(
+            `[checkInterval] Checking if player ${playerIdRef.current} has been created...`
+          );
+          console.log(
+            `[checkInterval] Current players:`,
+            Array.from(playersRef.current.keys())
+          );
+
+          if (
+            playerIdRef.current &&
+            playersRef.current.has(playerIdRef.current)
+          ) {
+            console.log(
+              `[checkInterval] Player ${playerIdRef.current} has been created!`
+            );
+            clearInterval(checkInterval);
+
+            // Apply the name
+            const player = playersRef.current.get(playerIdRef.current);
+            if (player) {
+              console.log(
+                `[checkInterval] Setting player name to "${playerName}"`
+              );
+              player.name = playerName;
+
+              // Update the health bar if it exists
+              if (player.healthBar) {
+                console.log(
+                  `[checkInterval] Updating health bar with new name`
+                );
+                updatePlayerHealthBar(player);
+              }
+
+              // Send the name update to the server
+              if (
+                socketRef.current &&
+                socketRef.current.readyState === WebSocket.OPEN
+              ) {
+                console.log(
+                  `[checkInterval] Sending name update to server: "${playerName}"`
+                );
+                socketRef.current.send(
+                  JSON.stringify({
+                    type: "updateName",
+                    data: {
+                      id: playerIdRef.current,
+                      name: playerName,
+                    },
+                  })
+                );
+              }
+            }
+          }
+        }, 500); // Check every 500ms
+
+        // Clean up the interval when the component unmounts or when the dependencies change
+        return () => {
+          clearInterval(checkInterval);
+        };
+      }
+    }
+  }, [playerName, playerIdRef.current]);
+
+  // Function to directly fix the player name if needed
+  const fixPlayerName = () => {
+    if (playerIdRef.current && playerName) {
+      console.log(
+        `[fixPlayerName] Checking if player ${playerIdRef.current} name needs to be fixed`
+      );
+      console.log(
+        `[fixPlayerName] Current players:`,
+        Array.from(playersRef.current.keys())
+      );
+
+      // Check if the player ID exists in the map
+      if (playersRef.current.has(playerIdRef.current)) {
+        // Normal case - player ID is in the map
+        const player = playersRef.current.get(playerIdRef.current);
+        if (player) {
+          console.log(
+            `[fixPlayerName] Current player name: "${player.name}", desired name: "${playerName}"`
+          );
+
+          // Always update the name
+          console.log(
+            `[fixPlayerName] Fixing player name from "${player.name}" to "${playerName}"`
+          );
+          player.name = playerName;
+
+          // Rest of code...
+        }
+      } else {
+        // Player ID not found in map - this is the key issue!
+        console.log(
+          `[fixPlayerName] Player ${playerIdRef.current} not found in playersRef`
+        );
+
+        // CRITICAL: If there's only one player in the map, assume it's the local player
+        // This handles the case where the player ID is wrong but there's only one player
+        if (playersRef.current.size === 1) {
+          const onlyPlayerId = Array.from(playersRef.current.keys())[0];
+          console.log(
+            `[fixPlayerName] Only one player in map with ID ${onlyPlayerId} - assuming this is the local player`
+          );
+
+          // Update playerIdRef to match the actual player ID
+          const oldId = playerIdRef.current;
+          playerIdRef.current = onlyPlayerId;
+          console.log(
+            `[fixPlayerName] Updated playerIdRef from ${oldId} to ${playerIdRef.current}`
+          );
+
+          // Now fix the name
+          const player = playersRef.current.get(onlyPlayerId);
+          if (player) {
+            console.log(
+              `[fixPlayerName] Current player name: "${player.name}", desired name: "${playerName}"`
+            );
+
+            // Always update the name
+            console.log(
+              `[fixPlayerName] Fixing player name from "${player.name}" to "${playerName}"`
+            );
+            player.name = playerName;
+
+            // Update the health bar if it exists
+            if (player.healthBar) {
+              console.log(`[fixPlayerName] Updating health bar with new name`);
+              updatePlayerHealthBar(player);
+            } else {
+              console.log(`[fixPlayerName] No health bar found, creating one`);
+              // Try to create a health bar if the model exists
+              if (player.model) {
+                createPlayerHealthBar(player);
+              } else {
+                console.log(
+                  `[fixPlayerName] Cannot create health bar - model not ready`
+                );
+              }
+            }
+
+            // Send the name update to the server
+            if (
+              socketRef.current &&
+              socketRef.current.readyState === WebSocket.OPEN
+            ) {
+              console.log(
+                `[fixPlayerName] Sending name update to server: "${playerName}"`
+              );
+              socketRef.current.send(
+                JSON.stringify({
+                  type: "updateName",
+                  data: {
+                    id: onlyPlayerId, // Use the correct ID
+                    name: playerName,
+                  },
+                })
+              );
+            } else {
+              console.warn(
+                `[fixPlayerName] WebSocket not ready, cannot send name update`
+              );
+            }
+
+            // Update player stats if scoreboard is visible
+            if (showScoreboard) {
+              updatePlayerStats();
+            }
+
+            return true; // Name was fixed
+          }
+        } else {
+          // More than one player or no players
+          console.log(
+            `[fixPlayerName] Multiple players in map, can't determine which is local player`
+          );
+          console.log(`[fixPlayerName] Sending name update to server anyway`);
+
+          // Send the name update to the server anyway
+          if (
+            socketRef.current &&
+            socketRef.current.readyState === WebSocket.OPEN
+          ) {
+            console.log(
+              `[fixPlayerName] Sending name update to server: "${playerName}"`
+            );
+            socketRef.current.send(
+              JSON.stringify({
+                type: "updateName",
+                data: {
+                  id: playerIdRef.current,
+                  name: playerName,
+                },
+              })
+            );
+            return true; // Message was sent
+          } else {
+            console.warn(
+              `[fixPlayerName] WebSocket not ready, cannot send name update`
+            );
+          }
+        }
+      }
+    } else {
+      console.log(
+        `[fixPlayerName] Cannot fix player name: playerIdRef.current=${playerIdRef.current}, playerName="${playerName}"`
+      );
+    }
+
+    return false; // Name was not fixed
+  };
+
+  // Add a button to the debug panel to fix the player name
+  const fixNameButton = (
+    <button
+      onClick={fixPlayerName}
+      style={{
+        marginTop: "10px",
+        padding: "5px 10px",
+        backgroundColor: "#4CAF50",
+        color: "white",
+        border: "none",
+        borderRadius: "3px",
+        cursor: "pointer",
+      }}
+    >
+      Fix Player Name
+    </button>
+  );
+
+  // Add a useEffect to fix the player name when the component mounts
+  useEffect(() => {
+    // This will run once when the component mounts
+    console.log(`[useEffect] Component mounted`);
+
+    // Set up an interval to check and fix the player name
+    const nameCheckInterval = setInterval(() => {
+      if (playerIdRef.current && playerName && !showNameMenu && !isRespawning) {
+        console.log(`[nameCheckInterval] Checking player name...`);
+        fixPlayerName();
+      }
+    }, 2000); // Check every 2 seconds
+
+    return () => {
+      clearInterval(nameCheckInterval);
+    };
+  }, []);
+
+  // Add a useEffect to check for player ID mismatch on component mount
+  useEffect(() => {
+    // This will run once when the component mounts
+    console.log(
+      `[useEffect] Component mounted, checking for player ID mismatch`
+    );
+
+    // Check if there's a player ID mismatch
+    if (playerIdRef.current && !playersRef.current.has(playerIdRef.current)) {
+      console.log(
+        `[useEffect] Player ID mismatch detected: ${playerIdRef.current} not in playersRef`
+      );
+      console.log(
+        `[useEffect] Current players:`,
+        Array.from(playersRef.current.keys())
+      );
+
+      // If there's only one player in the map, assume it's the local player
+      if (playersRef.current.size === 1) {
+        const onlyPlayerId = Array.from(playersRef.current.keys())[0];
+        console.log(
+          `[useEffect] Only one player in map with ID ${onlyPlayerId} - assuming this is the local player`
+        );
+
+        // Update playerIdRef to match the actual player ID
+        const oldId = playerIdRef.current;
+        playerIdRef.current = onlyPlayerId;
+        console.log(
+          `[useEffect] Updated playerIdRef from ${oldId} to ${playerIdRef.current}`
+        );
+
+        // If we have a player name, update it
+        if (playerName) {
+          const player = playersRef.current.get(onlyPlayerId);
+          if (player) {
+            console.log(`[useEffect] Updating player name to "${playerName}"`);
+            player.name = playerName;
+
+            // Update the health bar if it exists
+            if (player.healthBar) {
+              updatePlayerHealthBar(player);
+            }
+          }
+        }
+      }
+    }
+  }, []);
+
+  // Return the JSX
   return (
     <div
       ref={containerRef}
@@ -2557,6 +4232,160 @@ const Game: React.FC = () => {
         cursor: "none",
       }}
     >
+      {/* Player Name Menu */}
+      {(showNameMenu || isRespawning) && (
+        <div
+          style={{
+            position: "absolute",
+            top: 0,
+            left: 0,
+            width: "100%",
+            height: "100%",
+            display: "flex",
+            justifyContent: "center",
+            alignItems: "center",
+            backgroundColor: "rgba(0, 0, 0, 0.7)",
+            zIndex: 1000,
+          }}
+        >
+          <div
+            style={{
+              background: "#222",
+              padding: "30px",
+              borderRadius: "10px",
+              boxShadow: "0 0 20px rgba(0, 0, 0, 0.5)",
+              width: "400px",
+              textAlign: "center",
+            }}
+          >
+            <h2 style={{ color: "#fff", marginBottom: "20px" }}>
+              {isRespawning ? "You Died!" : "Welcome to the Game"}
+            </h2>
+            <p style={{ color: "#ccc", marginBottom: "20px" }}>
+              {isRespawning
+                ? "Enter your name to respawn:"
+                : "Enter your name to begin:"}
+            </p>
+            <input
+              type="text"
+              value={playerName}
+              onChange={(e) => setPlayerName(e.target.value)}
+              placeholder="Enter your name"
+              style={{
+                width: "100%",
+                padding: "10px",
+                marginBottom: "20px",
+                borderRadius: "5px",
+                border: "none",
+                fontSize: "16px",
+              }}
+              autoFocus
+            />
+            <button
+              onClick={() => {
+                console.log(
+                  `Name menu button clicked. playerName: "${playerName}", isRespawning: ${isRespawning}`
+                );
+                console.log(`Current playerIdRef: ${playerIdRef.current}`);
+                console.log(
+                  `Current players in playersRef:`,
+                  Array.from(playersRef.current.keys())
+                );
+
+                if (playerName.trim()) {
+                  console.log(`Name is valid: "${playerName}"`);
+
+                  // Store the name in state but don't try to update the player object yet
+                  // The useEffect hook will handle applying the name when the player is created
+                  console.log(
+                    `Storing name "${playerName}" to be applied when player is created`
+                  );
+
+                  // Hide the name menu
+                  setShowNameMenu(false);
+
+                  // If we're respawning, handle that separately
+                  if (isRespawning) {
+                    console.log(`Handling respawn with name: "${playerName}"`);
+                    // Handle respawn
+                    const localPlayer = playersRef.current.get(
+                      playerIdRef.current || 0
+                    );
+                    console.log(
+                      `Found local player:`,
+                      localPlayer
+                        ? {
+                            id: localPlayer.id,
+                            name: localPlayer.name,
+                            health: localPlayer.health,
+                          }
+                        : "null"
+                    );
+
+                    if (localPlayer && playerIdRef.current) {
+                      // Update player name
+                      updatePlayerName(playerIdRef.current, playerName);
+
+                      // Reset health
+                      localPlayer.health = localPlayer.maxHealth;
+
+                      // Reset position to a random location
+                      if (localPlayer.model) {
+                        localPlayer.model.position.set(
+                          Math.random() * 10 - 5,
+                          0,
+                          Math.random() * 10 - 5
+                        );
+
+                        // Reset rotation
+                        localPlayer.model.rotation.x = 0;
+
+                        // Show health bar again
+                        if (localPlayer.healthBar) {
+                          localPlayer.healthBar.style.visibility = "visible";
+                          updatePlayerHealthBar(localPlayer);
+                        }
+
+                        // Reset to idle animation
+                        if (
+                          localPlayer.actions &&
+                          localPlayer.actions["idle"]
+                        ) {
+                          localPlayer.actions["idle"].reset().play();
+                        }
+
+                        console.log(
+                          `Player ${localPlayer.id} respawned as ${localPlayer.name}!`
+                        );
+                      }
+                    }
+                    setIsRespawning(false);
+                  } else {
+                    console.log(
+                      `Initial game start with name: "${playerName}"`
+                    );
+                    // We'll let the useEffect hook handle applying the name when the player is created
+                  }
+                }
+              }}
+              style={{
+                padding: "10px 20px",
+                backgroundColor: "#4CAF50",
+                color: "white",
+                border: "none",
+                borderRadius: "5px",
+                fontSize: "16px",
+                cursor: "pointer",
+              }}
+              disabled={!playerName.trim()}
+            >
+              {isRespawning ? "Respawn" : "Start Game"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Keep existing UI elements */}
       <div
         style={{
           position: "absolute",
@@ -2575,6 +4404,7 @@ const Game: React.FC = () => {
         <p style={{ margin: "5px 0" }}>Space - Jump</p>
         <p style={{ margin: "5px 0" }}>Mouse - Camera</p>
         <p style={{ margin: "5px 0" }}>Left Click/F - Shoot Fireball</p>
+        <p style={{ margin: "5px 0" }}>Tab - Show Scoreboard (Hold)</p>
       </div>
 
       {/* Add coin counter display */}
@@ -2604,6 +4434,14 @@ const Game: React.FC = () => {
           {coinCountRef.current}
         </span>
       </div>
+
+      {/* Health bar */}
+      <div className="health-bar-container">
+        <div id="player-health-bar" className="health-bar"></div>
+      </div>
+
+      {/* Render scoreboard */}
+      {renderScoreboard()}
     </div>
   );
 };

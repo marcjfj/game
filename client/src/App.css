@@ -23,3 +23,85 @@ html {
   font-size: calc(10px + 2vmin);
   color: white;
 }
+
+/* Scoreboard styles */
+.scoreboard {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background-color: rgba(0, 0, 0, 0.8);
+  color: white;
+  border-radius: 5px;
+  padding: 15px;
+  min-width: 400px;
+  z-index: 1000;
+  font-family: Arial, sans-serif;
+  box-shadow: 0 0 20px rgba(0, 0, 0, 0.5);
+}
+
+.scoreboard-header {
+  text-align: center;
+  font-size: 24px;
+  font-weight: bold;
+  margin-bottom: 15px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #444;
+  color: #ffcc00;
+}
+
+.scoreboard-content {
+  display: flex;
+  flex-direction: column;
+}
+
+.scoreboard-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 0;
+  border-bottom: 1px solid #333;
+}
+
+.scoreboard-row.header {
+  font-weight: bold;
+  color: #aaa;
+  padding-bottom: 10px;
+  margin-bottom: 5px;
+  border-bottom: 2px solid #555;
+}
+
+.scoreboard-row > div {
+  flex: 1;
+  text-align: center;
+  padding: 0 5px;
+}
+
+.scoreboard-row > div:first-child {
+  text-align: left;
+  padding-left: 10px;
+}
+
+.local-player {
+  background-color: rgba(255, 204, 0, 0.1);
+  border-radius: 3px;
+}
+
+/* Health bar styles */
+.health-bar-container {
+  position: absolute;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 300px;
+  height: 20px;
+  background-color: rgba(0, 0, 0, 0.5);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.health-bar {
+  height: 100%;
+  width: 100%;
+  background-color: #00ff00;
+  transition: width 0.3s, background-color 0.3s;
+}
