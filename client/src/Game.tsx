@@ -458,7 +458,7 @@ const Game: React.FC = () => {
     if (!sceneRef.current || !modelRef.current) return;
 
     // Create basic materials with absolutely no textures for environment objects
-    const basicMaterial = new THREE.MeshBasicMaterial({ color: 0xcccccc });
+    const basicMaterial = new THREE.MeshLambertMaterial({ color: 0xcccccc }); // Changed to MeshLambertMaterial for shadows
 
     // Process all scene objects recursively
     sceneRef.current.traverse((object) => {
@@ -497,6 +497,12 @@ const Game: React.FC = () => {
           return; // Don't modify platform materials
         }
 
+        // Preserve palm tree materials
+        if (mesh.userData && mesh.userData.isPalmTree) {
+          console.log("Preserving palm tree material");
+          return; // Don't modify palm tree materials
+        }
+
         // For all other objects, use simple materials
         // Get color from original material if possible
         let color = 0xcccccc;
@@ -509,8 +515,14 @@ const Game: React.FC = () => {
           }
         } catch (e) {}
 
-        // Create a completely basic material with no textures
-        mesh.material = new THREE.MeshBasicMaterial({ color });
+        // Create a completely basic material with no textures but preserve shadow properties
+        const newMaterial = new THREE.MeshLambertMaterial({ color });
+        const castShadow = mesh.castShadow;
+        const receiveShadow = mesh.receiveShadow;
+
+        mesh.material = newMaterial;
+        mesh.castShadow = castShadow;
+        mesh.receiveShadow = receiveShadow;
       }
 
       // Disable non-essential lights
@@ -707,7 +719,7 @@ const Game: React.FC = () => {
       .then(([normalMap, roughnessMap]) => {
         console.log("All textures loaded successfully, creating PBR floor...");
         // Create the floor
-        const floorSize = 100;
+        const floorSize = 200; // Increased from 100 to 200 for a larger map
         const floorGeometry = new THREE.PlaneGeometry(
           floorSize,
           floorSize,
@@ -805,11 +817,50 @@ const Game: React.FC = () => {
         );
       });
 
-    // Create just a few simple platforms for jumping
+    // Create more platforms for jumping with varied heights and sizes
     const platforms = [
+      // Original platforms
       { x: 5, y: 0.5, z: 5, size: 3 },
       { x: -5, y: 1, z: -5, size: 3 },
       { x: 8, y: 1.5, z: -3, size: 2 },
+
+      // New platforms - creating a path/course across the map
+      { x: 12, y: 2, z: 8, size: 2.5 },
+      { x: 18, y: 2.5, z: 12, size: 2 },
+      { x: 25, y: 3, z: 15, size: 3 },
+      { x: 32, y: 3.5, z: 10, size: 2.5 },
+      { x: 40, y: 4, z: 5, size: 3 },
+      { x: 35, y: 4.5, z: -5, size: 2 },
+      { x: 28, y: 5, z: -12, size: 3.5 },
+      { x: 20, y: 4.5, z: -18, size: 2.5 },
+      { x: 10, y: 4, z: -25, size: 3 },
+      { x: 0, y: 3.5, z: -30, size: 2.5 },
+      { x: -10, y: 3, z: -25, size: 3 },
+      { x: -18, y: 2.5, z: -18, size: 2.5 },
+      { x: -25, y: 2, z: -10, size: 3 },
+      { x: -30, y: 1.5, z: 0, size: 2.5 },
+      { x: -25, y: 2, z: 10, size: 3 },
+      { x: -18, y: 2.5, z: 18, size: 2.5 },
+      { x: -10, y: 3, z: 25, size: 3 },
+      { x: 0, y: 3.5, z: 30, size: 2.5 },
+
+      // Some floating islands
+      { x: -15, y: 6, z: -15, size: 5 },
+      { x: 15, y: 7, z: 15, size: 5 },
+      { x: 0, y: 8, z: 0, size: 6 },
+
+      // Stepping stones
+      { x: -40, y: 1, z: -40, size: 1.5 },
+      { x: -35, y: 1.2, z: -38, size: 1.5 },
+      { x: -30, y: 1.4, z: -36, size: 1.5 },
+      { x: -25, y: 1.6, z: -34, size: 1.5 },
+      { x: -20, y: 1.8, z: -32, size: 1.5 },
+
+      // Platforms in corners
+      { x: 45, y: 2, z: 45, size: 4 },
+      { x: -45, y: 2, z: 45, size: 4 },
+      { x: 45, y: 2, z: -45, size: 4 },
+      { x: -45, y: 2, z: -45, size: 4 },
     ];
 
     // Basic material for all objects
@@ -911,11 +962,11 @@ const Game: React.FC = () => {
       scene.add(mesh);
     });
 
-    // Create a few simple decorative elements
-    // Palm trees using GLTF model
-    for (let i = 0; i < 5; i++) {
+    // Create more trees for a forest-like environment
+    for (let i = 0; i < 25; i++) {
+      // Increased from 5 to 25 trees
       const angle = Math.random() * Math.PI * 2;
-      const dist = 10 + Math.random() * 10;
+      const dist = 10 + Math.random() * 80; // Increased max distance from 20 to 90
       const posX = Math.cos(angle) * dist;
       const posZ = Math.sin(angle) * dist;
 
@@ -929,6 +980,9 @@ const Game: React.FC = () => {
           // Scale and position the model - palm trees are typically tall
           model.scale.set(1.5, 1.5, 1.5); // Slightly smaller scale
           model.position.set(posX, 0, posZ); // Initial position
+
+          // Tag as palm tree for texture limit fix
+          model.userData.isPalmTree = true;
 
           // Rotate randomly for variety
           model.rotation.y = Math.random() * Math.PI * 2;
@@ -944,6 +998,15 @@ const Game: React.FC = () => {
 
           // Add to scene
           scene.add(model);
+
+          // Enable shadows for all meshes in the model
+          model.traverse((node) => {
+            if ((node as THREE.Mesh).isMesh) {
+              const mesh = node as THREE.Mesh;
+              mesh.castShadow = true;
+              mesh.receiveShadow = true;
+            }
+          });
 
           // Find the trunk for collision
           let trunkFound = false;
@@ -1019,6 +1082,8 @@ const Game: React.FC = () => {
                 mesh.material = new THREE.MeshLambertMaterial({
                   color: 0x8b4513,
                 }); // Brown for trunk
+                mesh.castShadow = true;
+                mesh.receiveShadow = true;
               } else if (
                 node.name.includes("leaves") ||
                 node.name.includes("Fronds")
@@ -1029,6 +1094,8 @@ const Game: React.FC = () => {
                   opacity: 0.95,
                   side: THREE.DoubleSide, // Render both sides of leaf geometry
                 }); // Green for leaves
+                mesh.castShadow = true; // Leaves cast shadows
+                mesh.receiveShadow = false; // But don't receive them for better performance
               }
             }
           });
@@ -1047,15 +1114,19 @@ const Game: React.FC = () => {
           const trunkGeo = new THREE.CylinderGeometry(0.2, 0.3, 2, 8);
           const trunk = new THREE.Mesh(
             trunkGeo,
-            new THREE.MeshBasicMaterial({ color: 0x8b4513 })
+            new THREE.MeshLambertMaterial({ color: 0x8b4513 })
           );
+          trunk.castShadow = true;
+          trunk.receiveShadow = true;
 
           const topGeo = new THREE.ConeGeometry(1, 2, 8);
           const top = new THREE.Mesh(
             topGeo,
-            new THREE.MeshBasicMaterial({ color: 0x228b22 })
+            new THREE.MeshLambertMaterial({ color: 0x228b22 })
           );
           top.position.y = 2;
+          top.castShadow = true;
+          top.receiveShadow = true;
 
           const tree = new THREE.Group();
           tree.add(trunk);
@@ -3825,7 +3896,8 @@ const Game: React.FC = () => {
     // Renderer setup
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.shadowMap.enabled = false; // Disable shadows completely
+    renderer.shadowMap.enabled = true; // Enable shadows
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap; // Use PCF soft shadows for better quality
     renderer.sortObjects = true; // Enable manual sorting
     renderer.autoClear = true;
     renderer.setClearColor(0x87ceeb, 1); // Sky blue background
@@ -3837,17 +3909,29 @@ const Game: React.FC = () => {
     controlPanelRef.current = initControlPanel();
 
     // Lighting
-    const ambientLight = new THREE.AmbientLight(0xffffff, 1);
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.6); // Reduced intensity to make shadows more visible
     scene.add(ambientLight);
 
-    // Single directional light, no shadows
-    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.5);
-    directionalLight.position.set(1, 1, 1);
-    directionalLight.castShadow = false;
+    // Directional light with shadows
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    directionalLight.position.set(50, 50, 50); // Position from above
+    directionalLight.castShadow = true;
+
+    // Configure shadow properties for performance
+    directionalLight.shadow.mapSize.width = 1024; // Shadow map resolution
+    directionalLight.shadow.mapSize.height = 1024;
+    directionalLight.shadow.camera.near = 10;
+    directionalLight.shadow.camera.far = 200;
+    directionalLight.shadow.camera.left = -50;
+    directionalLight.shadow.camera.right = 50;
+    directionalLight.shadow.camera.top = 50;
+    directionalLight.shadow.camera.bottom = -50;
+    directionalLight.shadow.bias = -0.001; // Reduce shadow acne
+
     scene.add(directionalLight);
 
     // Add a hemisphere light for better ground illumination
-    const hemisphereLight = new THREE.HemisphereLight(0xffffff, 0x444444, 0.8);
+    const hemisphereLight = new THREE.HemisphereLight(0x87ceeb, 0x444444, 0.5); // Reduced intensity
     scene.add(hemisphereLight);
 
     // We'll skip creating the default ground plane here
