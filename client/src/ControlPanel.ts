@@ -6,8 +6,8 @@ const DEFAULT_CONFIG = {
     walkSpeed: 2,
     runSpeed: 8,
     maxHealth: 100,
-    jumpHeight: 2.5,
-    jumpDuration: 0.5,
+    jumpHeight: 3.5,
+    jumpDuration: 0.4,
   },
   fireball: {
     speed: 25,
